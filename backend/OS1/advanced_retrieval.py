@@ -245,6 +245,77 @@ class ContrastiveSPLADEEncoder(nn.Module):
         
         return loss
 
+class MemoryMonitor:
+    """
+    Monitor system memory usage and detect potential leaks.
+    """
+    def __init__(self, threshold_mb: float = 100):
+        self.threshold_mb = threshold_mb
+        self.memory_samples = []
+        self.sample_interval = 60  # seconds
+        self.last_sample_time = 0
+        
+    def check_leaks(self) -> bool:
+        """
+        Check for memory leaks by analyzing memory usage patterns.
+        
+        Returns:
+            True if leaks are detected, False otherwise.
+        """
+        current_time = time.time()
+        if current_time - self.last_sample_time < self.sample_interval:
+            return False
+            
+        # Get current memory usage
+        if torch.cuda.is_available():
+            current_memory = torch.cuda.memory_allocated() / (1024 * 1024)  # Convert to MB
+        else:
+            import psutil
+            process = psutil.Process()
+            current_memory = process.memory_info().rss / (1024 * 1024)  # Convert to MB
+            
+        # Add new sample
+        self.memory_samples.append((current_time, current_memory))
+        self.last_sample_time = current_time
+        
+        # Keep last hour of samples
+        cutoff_time = current_time - 3600
+        self.memory_samples = [(t, m) for t, m in self.memory_samples if t > cutoff_time]
+        
+        # Need at least 3 samples to detect leaks
+        if len(self.memory_samples) < 3:
+            return False
+            
+        # Check for consistent increase
+        times, memories = zip(*self.memory_samples)
+        
+        # Calculate rate of change
+        memory_growth = (memories[-1] - memories[0]) / (times[-1] - times[0])  # MB/s
+        
+        # Check if memory is growing faster than threshold
+        is_leaking = memory_growth > (self.threshold_mb / 3600)  # Convert threshold to MB/s
+        
+        if is_leaking:
+            logger.warning(f"Potential memory leak detected! Growth rate: {memory_growth:.2f} MB/s")
+            
+        return is_leaking
+        
+    def get_memory_stats(self) -> Dict[str, float]:
+        """Get current memory statistics."""
+        if not self.memory_samples:
+            return {}
+            
+        current_memory = self.memory_samples[-1][1]
+        peak_memory = max(m for _, m in self.memory_samples)
+        avg_memory = sum(m for _, m in self.memory_samples) / len(self.memory_samples)
+        
+        return {
+            "current_mb": current_memory,
+            "peak_mb": peak_memory,
+            "average_mb": avg_memory,
+            "samples_count": len(self.memory_samples)
+        }
+
 class HybridIndex:
     """
     Hybrid index combining sparse SPLADE vectors and dense embeddings.
@@ -274,42 +345,155 @@ class HybridIndex:
         self.indexed_count = 0
         self.last_modified = time.time()
         
+        # Cleanup scheduling
+        self._cleanup_scheduled = False
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 3600  # 1 hour
+        
+        # Memory monitoring and validation
+        self._memory_monitor = MemoryMonitor()
+        self._last_validation = time.time()
+        self._validation_interval = 300  # 5 minutes
+        
+    def _schedule_cleanup(self):
+        """Schedule periodic cleanup of memory resources."""
+        current_time = time.time()
+        if not self._cleanup_scheduled and (current_time - self._last_cleanup) > self._cleanup_interval:
+            self._cleanup_memory_resources()
+            self._last_cleanup = current_time
+            
+    def _cleanup_memory_resources(self):
+        """Clean up unused memory resources."""
+        try:
+            # Clean up invalid mappings
+            valid_mappings = []
+            for i, memory_id in enumerate(self.faiss_index_mapping):
+                if memory_id is not None and memory_id in self.documents:
+                    valid_mappings.append(memory_id)
+                    
+            # Rebuild FAISS index if needed
+            if len(valid_mappings) < len(self.faiss_index_mapping):
+                new_index = faiss.IndexFlatIP(self.faiss_index.d)
+                for memory_id in valid_mappings:
+                    vector = self._get_vector(memory_id)
+                    if vector is not None:
+                        new_index.add(np.array([vector], dtype=np.float32))
+                self.faiss_index = new_index
+                self.faiss_index_mapping = valid_mappings
+                
+            # Clean up unused mmap files
+            for memory_id in list(self.documents.keys()):
+                mmap_path = f"mmap_{memory_id}.bin"
+                if not os.path.exists(mmap_path):
+                    logger.warning(f"Missing mmap file for {memory_id}, removing from index")
+                    self.remove_document(memory_id)
+                    
+            logger.info("Completed memory resource cleanup")
+            
+        except Exception as e:
+            logger.error(f"Error during memory cleanup: {str(e)}")
+            
+    def _get_vector(self, memory_id: str) -> Optional[np.ndarray]:
+        """Safely retrieve vector for memory ID."""
+        try:
+            mmap_path = f"mmap_{memory_id}.bin"
+            if os.path.exists(mmap_path):
+                vector_data = np.memmap(mmap_path, dtype='float32', mode='r',
+                                      shape=(1, self.faiss_index.d))
+                return vector_data[0]
+        except Exception as e:
+            logger.error(f"Error retrieving vector for {memory_id}: {str(e)}")
+        return None
+        
+    def _validate_index(self) -> Dict[str, Any]:
+        """Validate index integrity and return status."""
+        status = {
+            "is_valid": True,
+            "errors": [],
+            "repairs_made": []
+        }
+        
+        try:
+            # Check for memory leaks
+            if self._memory_monitor.check_leaks():
+                status["errors"].append("Memory leak detected")
+                status["is_valid"] = False
+                self._cleanup_memory_resources()
+                status["repairs_made"].append("Memory cleanup performed")
+            
+            # Validate FAISS index
+            valid_count = 0
+            for i, memory_id in enumerate(self.faiss_index_mapping):
+                if memory_id is not None:
+                    if memory_id not in self.documents:
+                        status["errors"].append(f"Orphaned FAISS entry: {memory_id}")
+                        status["is_valid"] = False
+                    else:
+                        valid_count += 1
+                        
+            if valid_count != len(self.documents):
+                status["errors"].append("FAISS index/document store mismatch")
+                status["is_valid"] = False
+                
+            # Validate memory mapped files
+            for memory_id in self.documents:
+                mmap_path = f"mmap_{memory_id}.bin"
+                if not os.path.exists(mmap_path):
+                    status["errors"].append(f"Missing mmap file: {memory_id}")
+                    status["is_valid"] = False
+                    
+            return status
+            
+        except Exception as e:
+            status["is_valid"] = False
+            status["errors"].append(f"Validation error: {str(e)}")
+            return status
+            
+    def _periodic_validation(self):
+        """Run periodic validation checks."""
+        current_time = time.time()
+        if current_time - self._last_validation > self._validation_interval:
+            status = self._validate_index()
+            if not status["is_valid"]:
+                logger.warning(f"Index validation failed: {status['errors']}")
+                if status["repairs_made"]:
+                    logger.info(f"Repairs performed: {status['repairs_made']}")
+            self._last_validation = current_time
+            
     def index_document(self, 
                      memory_id: str, 
                      sparse_vector: Dict[int, float],
                      dense_vector: Optional[np.ndarray] = None,
                      metadata: Optional[Dict] = None) -> None:
-        """
-        Index a document.
-        
-        Args:
-            memory_id: Memory ID
-            sparse_vector: SPLADE sparse vector
-            dense_vector: Dense embedding vector
-            metadata: Additional metadata
-        """
-        # Store document metadata
-        self.documents[memory_id] = {
-            "indexed_at": time.time(),
-            "sparse_nnz": len(sparse_vector),
-            "metadata": metadata or {}
-        }
-        
-        # Index sparse vector
-        for token_id, weight in sparse_vector.items():
-            if token_id not in self.sparse_index:
-                self.sparse_index[token_id] = {}
+        try:
+            self._periodic_validation()  # Run validation check
+            # Store document metadata
+            self.documents[memory_id] = {
+                "indexed_at": time.time(),
+                "sparse_nnz": len(sparse_vector),
+                "metadata": metadata or {}
+            }
+            
+            # Index sparse vector
+            for token_id, weight in sparse_vector.items():
+                if token_id not in self.sparse_index:
+                    self.sparse_index[token_id] = {}
+                    
+                self.sparse_index[token_id][memory_id] = weight
                 
-            self.sparse_index[token_id][memory_id] = weight
+            # Index dense vector if provided
+            if dense_vector is not None:
+                self.faiss_index_mapping.append(memory_id)
+                self.faiss_index.add(np.array([dense_vector], dtype=np.float32))
+                
+            # Update statistics
+            self.indexed_count += 1
+            self.last_modified = time.time()
             
-        # Index dense vector if provided
-        if dense_vector is not None:
-            self.faiss_index_mapping.append(memory_id)
-            self.faiss_index.add(np.array([dense_vector], dtype=np.float32))
-            
-        # Update statistics
-        self.indexed_count += 1
-        self.last_modified = time.time()
+            self._schedule_cleanup()
+        except Exception as e:
+            logger.error(f"Error indexing document {memory_id}: {str(e)}")
+            raise
         
     def search_sparse(self, 
                      query_vector: Dict[int, float], 
@@ -588,7 +772,8 @@ class AdvancedRetrieval:
     def __init__(self, 
                  vocab_size: int = 30000,
                  embedding_dim: int = 768,
-                 device: Optional[str] = None):
+                 device: Optional[str] = None,
+                 cache_size: int = 10000):  # Increased cache size
         """
         Initialize the advanced retrieval system.
         
@@ -596,6 +781,7 @@ class AdvancedRetrieval:
             vocab_size: Vocabulary size
             embedding_dim: Embedding dimension
             device: Device to use
+            cache_size: Maximum cache size
         """
         # Set device
         if device is None:
@@ -616,7 +802,8 @@ class AdvancedRetrieval:
         
         # Cache for recently accessed items
         self.cache = OrderedDict()
-        self.max_cache_size = 1000
+        self.max_cache_size = cache_size
+        self.mmap_storage = {}  # Memory-mapped storage for large vectors
         
         logger.info(f"Initialized AdvancedRetrieval system with embedding dimension {embedding_dim}")
         
@@ -648,15 +835,30 @@ class AdvancedRetrieval:
             metadata=metadata
         )
         
-        # Add to cache
-        self.cache[memory_id] = {
-            "content": content,
-            "metadata": metadata or {}
-        }
+        # Enhanced caching with memory mapping for large vectors
+        if len(content) > 1000:  # For large content
+            mmap_path = f"mmap_{memory_id}.bin"
+            vector_data = np.memmap(mmap_path, dtype='float32', mode='w+', 
+                                  shape=(1, self.encoder.output_dim))
+            vector_data[0] = dense_vector
+            self.mmap_storage[memory_id] = mmap_path
+        else:
+            self.cache[memory_id] = {
+                "content": content,
+                "metadata": metadata or {},
+                "vector": dense_vector
+            }
         
-        # Trim cache if needed
         if len(self.cache) > self.max_cache_size:
-            self.cache.popitem(last=False)
+            # Enhanced LRU eviction
+            old_id, old_data = self.cache.popitem(last=False)
+            if old_id not in self.mmap_storage:
+                # Move to memory-mapped storage
+                mmap_path = f"mmap_{old_id}.bin"
+                vector_data = np.memmap(mmap_path, dtype='float32', mode='w+',
+                                      shape=(1, self.encoder.output_dim))
+                vector_data[0] = old_data["vector"]
+                self.mmap_storage[old_id] = mmap_path
             
     def retrieve(self, 
                query: str, 
@@ -707,6 +909,12 @@ class AdvancedRetrieval:
         # Remove from cache
         if memory_id in self.cache:
             self.cache.pop(memory_id)
+            
+        # Remove from memory-mapped storage
+        if memory_id in self.mmap_storage:
+            mmap_path = self.mmap_storage.pop(memory_id)
+            if os.path.exists(mmap_path):
+                os.remove(mmap_path)
             
         # Remove from index
         return self.index.remove_document(memory_id)

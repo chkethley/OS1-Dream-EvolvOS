@@ -1,1136 +1,823 @@
 """
-Self-Evolution Controller
+Self Evolution Controller for EvolvOS
 
-This module implements the controller for self-evolution in the EvolvOS system,
-enabling autonomous improvement through evolution cycles and feedback loops.
+Coordinates system-wide evolution and optimization across all components
+using Bayesian optimization and multi-objective evolution.
 """
 
-import os
-import sys
-import time
-import json
 import logging
-import random
-import uuid
-from typing import Dict, List, Any, Optional, Tuple, Callable, Set
-import numpy as np
-import traceback
-
-# Add new imports for LLM-guided evolution
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import time
+from typing import Dict, List, Optional, Tuple
 import torch
-from collections import deque
+import numpy as np
+from dataclasses import dataclass
+from collections import defaultdict
+from scipy.stats import norm
+import os
+
+from .bayesian_optimizer import BayesianOptimizer, MultiObjectiveBayesianOptimizer
+from .enhanced_nas_implementation import EnhancedNeuralArchitectureEvolution
+from .neural_architecture_evolution import NeuralArchitectureEvolution
 
 logger = logging.getLogger("EvolvOS.SelfEvolution")
 
+@dataclass
+class ComponentMetrics:
+    accuracy: float
+    efficiency: float
+    adaptability: float
+    last_updated: float
+
 class EvolutionMetrics:
-    """Tracks metrics related to system evolution."""
-    
     def __init__(self):
-        """Initialize evolution metrics."""
-        self.cycles_completed = 0
-        self.improvements_applied = 0
-        self.rejected_improvements = 0
-        self.performance_history = []
-        self.cycle_durations = []
-        self.start_time = time.time()
+        self.component_metrics = defaultdict(list)
+        self.evolution_history = []
+        self.optimization_history = defaultdict(list)
         
-    def record_cycle(self, metrics: Dict[str, float], duration: float, improvements: int):
-        """
-        Record metrics for an evolution cycle.
+    def add_component_metrics(self, 
+                            component: str, 
+                            metrics: ComponentMetrics):
+        """Add performance metrics for a component."""
+        self.component_metrics[component].append(metrics)
         
-        Args:
-            metrics: Performance metrics from the cycle
-            duration: Duration of the cycle in seconds
-            improvements: Number of improvements applied
-        """
-        self.cycles_completed += 1
-        self.improvements_applied += improvements
-        self.performance_history.append(metrics)
-        self.cycle_durations.append(duration)
-        
-    def record_rejected(self, count: int = 1):
-        """
-        Record rejected improvements.
-        
-        Args:
-            count: Number of rejected improvements
-        """
-        self.rejected_improvements += count
-        
-    def get_summary(self) -> Dict:
-        """
-        Get a summary of evolution metrics.
-        
-        Returns:
-            Dictionary with evolution metrics
-        """
-        total_time = time.time() - self.start_time
-        
-        # Calculate improvement rate (improvements per hour)
-        hours_elapsed = total_time / 3600
-        improvement_rate = self.improvements_applied / max(1, hours_elapsed)
-        
-        # Calculate average cycle duration
-        avg_duration = sum(self.cycle_durations) / max(1, len(self.cycle_durations))
-        
-        # Calculate performance trends if we have history
-        performance_trends = {}
-        if len(self.performance_history) > 1:
-            for metric in self.performance_history[0].keys():
-                values = [cycle_metrics.get(metric, 0) for cycle_metrics in self.performance_history]
-                if len(values) > 1:
-                    # Simple linear trend (positive is improving)
-                    trend = values[-1] - values[0]
-                    performance_trends[metric] = trend
+    def get_component_trend(self, component: str) -> Dict:
+        """Analyze performance trend for a component."""
+        if component not in self.component_metrics:
+            return {}
+            
+        metrics = self.component_metrics[component]
+        if not metrics:
+            return {}
+            
+        recent = metrics[-5:]  # Last 5 measurements
         
         return {
-            "cycles_completed": self.cycles_completed,
-            "improvements_applied": self.improvements_applied,
-            "rejected_improvements": self.rejected_improvements,
-            "total_runtime_seconds": total_time,
-            "improvement_rate_per_hour": improvement_rate,
-            "average_cycle_duration": avg_duration,
-            "performance_trends": performance_trends,
-            "last_metrics": self.performance_history[-1] if self.performance_history else {}
+            "accuracy_trend": np.mean([m.accuracy for m in recent]),
+            "efficiency_trend": np.mean([m.efficiency for m in recent]),
+            "adaptability_trend": np.mean([m.adaptability for m in recent]),
+            "improvement_rate": self._calculate_improvement_rate(recent)
         }
         
-    def to_dict(self) -> Dict:
-        """Convert metrics to dictionary for serialization."""
-        return {
-            "cycles_completed": self.cycles_completed,
-            "improvements_applied": self.improvements_applied,
-            "rejected_improvements": self.rejected_improvements,
-            "performance_history": self.performance_history,
-            "cycle_durations": self.cycle_durations,
-            "start_time": self.start_time
-        }
-        
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'EvolutionMetrics':
-        """Create metrics object from dictionary."""
-        metrics = cls()
-        metrics.cycles_completed = data.get("cycles_completed", 0)
-        metrics.improvements_applied = data.get("improvements_applied", 0)
-        metrics.rejected_improvements = data.get("rejected_improvements", 0)
-        metrics.performance_history = data.get("performance_history", [])
-        metrics.cycle_durations = data.get("cycle_durations", [])
-        metrics.start_time = data.get("start_time", time.time())
-        return metrics
+    def _calculate_improvement_rate(self, metrics: List[ComponentMetrics]) -> float:
+        """Calculate rate of improvement across all metrics."""
+        if len(metrics) < 2:
+            return 0.0
+            
+        changes = []
+        for i in range(1, len(metrics)):
+            acc_change = metrics[i].accuracy - metrics[i-1].accuracy
+            eff_change = metrics[i].efficiency - metrics[i-1].efficiency
+            adapt_change = metrics[i].adaptability - metrics[i-1].adaptability
+            changes.append((acc_change + eff_change + adapt_change) / 3)
+            
+        return np.mean(changes)
 
-class Improvement:
-    """Represents a potential system improvement."""
-    
-    def __init__(self, 
-                 component: str, 
-                 description: str,
-                 implementation: Optional[str] = None,
-                 estimated_impact: Optional[Dict[str, float]] = None):
-        """
-        Initialize an improvement.
-        
-        Args:
-            component: System component to improve
-            description: Description of the improvement
-            implementation: Implementation details (code, config, etc.)
-            estimated_impact: Estimated impact on metrics
-        """
-        self.id = str(uuid.uuid4())
-        self.component = component
-        self.description = description
-        self.implementation = implementation
-        self.estimated_impact = estimated_impact or {}
-        self.creation_time = time.time()
-        self.applied = False
-        self.applied_time = None
-        self.actual_impact = {}
-        self.rejected = False
-        self.rejection_reason = None
-        
-    def apply(self):
-        """Mark the improvement as applied."""
-        self.applied = True
-        self.applied_time = time.time()
-        
-    def reject(self, reason: str):
-        """
-        Mark the improvement as rejected.
-        
-        Args:
-            reason: Reason for rejection
-        """
-        self.rejected = True
-        self.rejection_reason = reason
-        
-    def record_impact(self, metrics: Dict[str, float]):
-        """
-        Record actual impact of the improvement.
-        
-        Args:
-            metrics: Measured impact on metrics
-        """
-        self.actual_impact = metrics
-        
-    def to_dict(self) -> Dict:
-        """Convert improvement to dictionary for serialization."""
-        return {
-            "id": self.id,
-            "component": self.component,
-            "description": self.description,
-            "implementation": self.implementation,
-            "estimated_impact": self.estimated_impact,
-            "creation_time": self.creation_time,
-            "applied": self.applied,
-            "applied_time": self.applied_time,
-            "actual_impact": self.actual_impact,
-            "rejected": self.rejected,
-            "rejection_reason": self.rejection_reason
-        }
-        
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'Improvement':
-        """Create improvement object from dictionary."""
-        improvement = cls(
-            component=data.get("component", "unknown"),
-            description=data.get("description", ""),
-            implementation=data.get("implementation"),
-            estimated_impact=data.get("estimated_impact", {})
-        )
-        improvement.id = data.get("id", improvement.id)
-        improvement.creation_time = data.get("creation_time", improvement.creation_time)
-        improvement.applied = data.get("applied", False)
-        improvement.applied_time = data.get("applied_time")
-        improvement.actual_impact = data.get("actual_impact", {})
-        improvement.rejected = data.get("rejected", False)
-        improvement.rejection_reason = data.get("rejection_reason")
-        return improvement
-
-class SystemEvaluator:
-    """Evaluates system performance for evolution."""
-    
-    def __init__(self, evaluation_metrics: Optional[List[str]] = None):
-        """
-        Initialize the system evaluator.
-        
-        Args:
-            evaluation_metrics: List of metrics to evaluate
-        """
-        self.metrics = evaluation_metrics or [
-            "accuracy", "efficiency", "adaptability", "robustness", "memory_usage"
-        ]
-        
-    def evaluate(self, system: Any) -> Dict[str, float]:
-        """
-        Evaluate system performance.
-        
-        Args:
-            system: System to evaluate
-            
-        Returns:
-            Dictionary of performance metrics
-        """
-        metrics = {}
-        
-        # Get system status
-        status = system.get_status()
-        
-        # Memory efficiency metrics
-        if "memory" in status:
-            memory_stats = status["memory"]
-            total_items = memory_stats.get("total_items", 0)
-            volatile_items = memory_stats.get("volatile_items", 0)
-            
-            # Calculate memory usage ratio (lower is better)
-            memory_usage = volatile_items / max(1, total_items)
-            metrics["memory_usage"] = memory_usage
-            
-            # Estimate retrieval efficiency based on memory distribution
-            retrieval_efficiency = 1.0 - (memory_usage * 0.5)  # Simple heuristic
-            metrics["efficiency"] = retrieval_efficiency
-        
-        # Simulate accuracy based on system components
-        components = status.get("system", {}).get("components", [])
-        
-        # More components generally means more capability
-        component_count = len(components)
-        capability_score = min(1.0, component_count / 10)
-        metrics["adaptability"] = capability_score
-        
-        # Accuracy depends on retrieval system and memory
-        has_retrieval = "retrieval" in components
-        has_memory = "memory" in components
-        has_entity_graph = "entity_graph" in components
-        
-        # Better accuracy with more sophisticated components
-        base_accuracy = 0.7
-        if has_retrieval:
-            base_accuracy += 0.1
-        if has_memory:
-            base_accuracy += 0.1
-        if has_entity_graph:
-            base_accuracy += 0.1
-            
-        metrics["accuracy"] = base_accuracy
-        
-        # Robustness - placeholder for more sophisticated evaluation
-        metrics["robustness"] = 0.5 + random.random() * 0.2
-        
-        # Add random noise to make it more realistic
-        for key in metrics:
-            # Add small random fluctuation
-            metrics[key] += (random.random() - 0.5) * 0.05
-            # Ensure values are in [0, 1]
-            metrics[key] = max(0.0, min(1.0, metrics[key]))
-            
-        return metrics
-        
-    def evaluate_improvement(self, 
-                            system: Any, 
-                            improvement: Improvement) -> Dict[str, float]:
-        """
-        Estimate impact of an improvement.
-        
-        Args:
-            system: Current system state
-            improvement: Proposed improvement
-            
-        Returns:
-            Dictionary of estimated metric changes
-        """
-        baseline = self.evaluate(system)
-        impact = {}
-        
-        # Simple heuristic for estimating impact based on improvement component
-        component = improvement.component.lower()
-        
-        if component == "memory":
-            # Memory improvements typically affect efficiency and memory usage
-            impact["memory_usage"] = random.uniform(0.05, 0.15)  # Reduction
-            impact["efficiency"] = random.uniform(0.03, 0.08)  # Improvement
-            
-        elif component == "retrieval":
-            # Retrieval improvements affect accuracy and efficiency
-            impact["accuracy"] = random.uniform(0.03, 0.1)
-            impact["efficiency"] = random.uniform(0.02, 0.07)
-            
-        elif component == "optimization":
-            # General optimizations improve efficiency
-            impact["efficiency"] = random.uniform(0.05, 0.12)
-            impact["memory_usage"] = random.uniform(0.02, 0.08)
-            
-        elif component == "architecture":
-            # Architecture improvements affect adaptability and robustness
-            impact["adaptability"] = random.uniform(0.05, 0.15)
-            impact["robustness"] = random.uniform(0.03, 0.1)
-            
-        elif component == "integration":
-            # Integration improvements affect overall adaptability
-            impact["adaptability"] = random.uniform(0.04, 0.12)
-            
-        else:
-            # Unknown components have small random improvements
-            for metric in self.metrics:
-                impact[metric] = random.uniform(0.01, 0.05)
-                
-        # Ensure realistic improvements
-        for metric in impact:
-            # Convert reductions to negative values
-            if metric == "memory_usage":
-                impact[metric] = -impact[metric]
-                
-            # Ensure improvements don't exceed reasonable bounds
-            if metric in baseline:
-                if baseline[metric] + impact[metric] > 1.0:
-                    impact[metric] = 1.0 - baseline[metric]
-                if baseline[metric] + impact[metric] < 0.0:
-                    impact[metric] = -baseline[metric]
-                    
-        return impact
-
-class ImprovementGenerator:
-    """Generates potential system improvements."""
-    
+class CompressionPerformance:
     def __init__(self):
-        """Initialize the improvement generator."""
-        self.component_templates = {
-            "memory": [
-                "Implement {technique} for more efficient memory storage",
-                "Optimize memory retrieval using {algorithm}",
-                "Enhance entity extraction with {method}",
-                "Improve memory compression ratio with {approach}",
-                "Add {feature} to memory system for better recall"
-            ],
-            "retrieval": [
-                "Implement {technique} for more accurate retrieval",
-                "Optimize query processing with {algorithm}",
-                "Add support for {feature} in search results",
-                "Enhance ranking algorithm with {method}",
-                "Implement {approach} for better semantic matching"
-            ],
-            "optimization": [
-                "Apply {technique} to reduce computational overhead",
-                "Implement {algorithm} for faster processing",
-                "Use {method} to optimize resource utilization",
-                "Apply {approach} to improve system responsiveness",
-                "Implement {feature} for better scalability"
-            ],
-            "architecture": [
-                "Refactor {component} for better modularity",
-                "Implement {pattern} to improve system flexibility",
-                "Restructure {component} using {architecture}",
-                "Add {feature} to improve system extensibility",
-                "Implement {technique} for better component integration"
-            ]
+        self.compression_ratios = []
+        self.reconstruction_losses = []
+        self.processing_times = []
+        self.memory_savings = []
+        
+    def add_metric(self, 
+                  compression_ratio: float,
+                  reconstruction_loss: float,
+                  processing_time: float,
+                  memory_saved: float):
+        self.compression_ratios.append(compression_ratio)
+        self.reconstruction_losses.append(reconstruction_loss)
+        self.processing_times.append(processing_time)
+        self.memory_savings.append(memory_saved)
+        
+    def get_average_metrics(self) -> Dict:
+        if not self.compression_ratios:
+            return {}
+            
+        return {
+            "avg_compression_ratio": np.mean(self.compression_ratios),
+            "avg_reconstruction_loss": np.mean(self.reconstruction_losses),
+            "avg_processing_time": np.mean(self.processing_times),
+            "avg_memory_saved": np.mean(self.memory_savings),
+            "total_samples": len(self.compression_ratios)
         }
-        
-        self.techniques = {
-            "memory": [
-                "hierarchical indexing", "content-based hashing", 
-                "delta encoding", "adaptive caching", "bloom filters",
-                "prefix trees", "sparse matrix compression"
-            ],
-            "retrieval": [
-                "bi-encoder matching", "approximate nearest neighbors",
-                "query expansion", "relevance feedback", "lexical pruning",
-                "hybrid ranking", "contextual reranking"
-            ],
-            "optimization": [
-                "lazy evaluation", "memoization", "vectorized operations",
-                "batched processing", "asynchronous execution",
-                "parallel computation", "incremental updates"
-            ],
-            "architecture": [
-                "mediator pattern", "observer pattern", "dependency injection",
-                "microservices", "event sourcing", "CQRS pattern",
-                "hexagonal architecture", "layered design"
-            ]
-        }
-        
-    def generate_description(self, component: str) -> str:
-        """
-        Generate an improvement description.
-        
-        Args:
-            component: System component to improve
-            
-        Returns:
-            Improvement description
-        """
-        # Get templates for component
-        templates = self.component_templates.get(
-            component, self.component_templates["architecture"]
-        )
-        
-        # Get techniques for component
-        techniques = self.techniques.get(
-            component, self.techniques["optimization"]
-        )
-        
-        # Select random template and technique
-        template = random.choice(templates)
-        technique = random.choice(techniques)
-        
-        # Fill template
-        placeholders = ["technique", "algorithm", "method", "approach", "feature", 
-                      "component", "pattern", "architecture"]
-        
-        for placeholder in placeholders:
-            if "{" + placeholder + "}" in template:
-                template = template.replace("{" + placeholder + "}", technique)
-                
-        return template
-        
-    def generate_improvement(self, 
-                          system: Any, 
-                          evaluator: SystemEvaluator) -> Improvement:
-        """
-        Generate a potential system improvement.
-        
-        Args:
-            system: Current system state
-            evaluator: System evaluator
-            
-        Returns:
-            Generated improvement
-        """
-        # Select a component to improve
-        components = ["memory", "retrieval", "optimization", "architecture"]
-        weights = [0.3, 0.3, 0.2, 0.2]  # Higher weights for memory and retrieval
-        component = random.choices(components, weights=weights, k=1)[0]
-        
-        # Generate improvement description
-        description = self.generate_description(component)
-        
-        # Generate placeholder implementation
-        implementation = f"# TODO: Implement {description}\n"
-        
-        # Create improvement
-        improvement = Improvement(
-            component=component,
-            description=description,
-            implementation=implementation
-        )
-        
-        # Estimate impact
-        impact = evaluator.evaluate_improvement(system, improvement)
-        improvement.estimated_impact = impact
-        
-        return improvement
-        
-    def generate_improvements(self, 
-                           system: Any,
-                           evaluator: SystemEvaluator,
-                           count: int = 3) -> List[Improvement]:
-        """
-        Generate multiple potential improvements.
-        
-        Args:
-            system: Current system state
-            evaluator: System evaluator
-            count: Number of improvements to generate
-            
-        Returns:
-            List of generated improvements
-        """
-        improvements = []
-        
-        for _ in range(count):
-            improvement = self.generate_improvement(system, evaluator)
-            improvements.append(improvement)
-            
-        return improvements
 
-class ImprovementSelector:
-    """Selects the best improvements to apply."""
-    
+class ArchitectureEvolution:
     def __init__(self):
-        """Initialize the improvement selector."""
-        self.metric_weights = {
-            "accuracy": 0.3,
-            "efficiency": 0.25,
-            "adaptability": 0.2,
-            "robustness": 0.15,
-            "memory_usage": 0.1
-        }
+        self.architecture_history = []
+        self.performance_metrics = defaultdict(list)
+        self.best_architectures = {}
         
-    def calculate_score(self, improvement: Improvement) -> float:
-        """
-        Calculate a score for an improvement.
-        
-        Args:
-            improvement: Improvement to score
-            
-        Returns:
-            Improvement score
-        """
-        score = 0.0
-        impact = improvement.estimated_impact
-        
-        for metric, weight in self.metric_weights.items():
-            if metric in impact:
-                # For memory_usage, lower is better
-                metric_impact = impact[metric]
-                if metric == "memory_usage":
-                    metric_impact = -metric_impact
-                    
-                score += metric_impact * weight
-                
-        return score
-        
-    def rank_improvements(self, 
-                        improvements: List[Improvement]) -> List[Tuple[Improvement, float]]:
-        """
-        Rank improvements by score.
-        
-        Args:
-            improvements: List of improvements to rank
-            
-        Returns:
-            List of (improvement, score) tuples, sorted by score
-        """
-        scored_improvements = []
-        
-        for improvement in improvements:
-            score = self.calculate_score(improvement)
-            scored_improvements.append((improvement, score))
-            
-        # Sort by score (descending)
-        scored_improvements.sort(key=lambda x: x[1], reverse=True)
-        
-        return scored_improvements
-        
-    def select_improvements(self, 
-                         improvements: List[Improvement],
-                         max_count: int = 1) -> List[Improvement]:
-        """
-        Select the best improvements to apply.
-        
-        Args:
-            improvements: List of improvements to select from
-            max_count: Maximum number of improvements to select
-            
-        Returns:
-            List of selected improvements
-        """
-        # Rank improvements
-        ranked_improvements = self.rank_improvements(improvements)
-        
-        # Select top improvements
-        selected = []
-        for improvement, score in ranked_improvements:
-            if len(selected) >= max_count:
-                break
-                
-            # Only select improvements with positive score
-            if score > 0:
-                selected.append(improvement)
-                
-        return selected
-
-# Add a new class for LLM-guided evolution
-class LLMGuidedEvolution:
-    """
-    Implements LLM-guided evolution with Evolution of Thought (EoT) technique.
-    
-    Based on research in "LLM Guided Evolution -- The Automation of Models Advancing Models" (2024),
-    this approach uses LLMs to reflect on previous evolution attempts and guide future mutations.
-    """
-    
-    def __init__(self, model_name: str = "meta-llama/Llama-3.2-3B", device: str = "cpu", 
-                 memory_size: int = 10, temperature: float = 0.7):
-        """
-        Initialize the LLM-guided evolution system.
-        
-        Args:
-            model_name: Name of the LLM model to use
-            device: Device to run the model on ('cpu' or 'cuda')
-            memory_size: Number of past mutations to remember
-            temperature: Temperature for LLM generation (higher = more diverse)
-        """
-        self.model_name = model_name
-        self.device = device
-        self.memory_size = memory_size
-        self.temperature = temperature
-        self.evolution_memory = deque(maxlen=memory_size)
-        
-        # Load the model and tokenizer if available
-        try:
-            logger.info(f"Loading LLM model {model_name}...")
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-            self.llm_available = True
-            logger.info(f"LLM model loaded successfully")
-        except Exception as e:
-            logger.warning(f"Could not load LLM model: {e}")
-            logger.warning("Falling back to template-based evolution")
-            self.llm_available = False
-    
-    def record_mutation(self, component: str, mutation: str, metrics_before: Dict[str, float], 
-                       metrics_after: Dict[str, float], success: bool):
-        """
-        Record a mutation and its impact for learning.
-        
-        Args:
-            component: Component that was modified
-            mutation: Description of the modification
-            metrics_before: Performance metrics before modification
-            metrics_after: Performance metrics after modification
-            success: Whether the mutation was successful
-        """
-        impact = {}
-        for key in metrics_after:
-            if key in metrics_before:
-                impact[key] = metrics_after[key] - metrics_before[key]
-        
-        self.evolution_memory.append({
+    def add_architecture_result(self, 
+                              component: str,
+                              architecture: Dict,
+                              performance: Dict):
+        self.architecture_history.append({
             "component": component,
-            "mutation": mutation,
-            "impact": impact,
-            "success": success,
+            "architecture": architecture,
+            "performance": performance,
             "timestamp": time.time()
         })
         
-    def generate_mutation(self, component: str, current_code: str, 
-                         target_metrics: List[str]) -> str:
-        """
-        Generate a mutation using the LLM with Evolution of Thought.
-        
-        Args:
-            component: Component to modify
-            current_code: Current implementation
-            target_metrics: Metrics to improve
+        # Track performance metrics
+        for metric, value in performance.items():
+            self.performance_metrics[f"{component}_{metric}"].append(value)
             
-        Returns:
-            Proposed mutation
-        """
-        if not self.llm_available:
-            return self._template_based_mutation(component, current_code)
-        
-        # Build the prompt with evolution history
-        prompt = self._build_eot_prompt(component, current_code, target_metrics)
-        
-        # Generate using the LLM
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=2000,
-                temperature=self.temperature,
-                top_p=0.9,
-                repetition_penalty=1.1
-            )
+        # Update best architecture if better
+        current_best = self.best_architectures.get(component, {}).get("performance", {}).get("val_accuracy", 0)
+        if performance.get("val_accuracy", 0) > current_best:
+            self.best_architectures[component] = {
+                "architecture": architecture,
+                "performance": performance
+            }
             
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Extract the mutation from the response
-        mutation = self._extract_mutation(response)
-        return mutation
-    
-    def _build_eot_prompt(self, component: str, current_code: str, target_metrics: List[str]) -> str:
-        """
-        Build a prompt for the LLM that includes Evolution of Thought.
-        
-        Args:
-            component: Component to modify
-            current_code: Current implementation
-            target_metrics: Metrics to improve
-            
-        Returns:
-            Prompt for the LLM
-        """
-        # Start with a system prompt
-        prompt = f"""You are an expert AI evolutionary system that optimizes code.
-
-TASK: You need to improve the following component: {component}
-
-TARGET METRICS TO IMPROVE: {', '.join(target_metrics)}
-
-CURRENT IMPLEMENTATION:
-```python
-{current_code}
-```
-
-"""
-
-        # Add evolution history for Evolution of Thought
-        if self.evolution_memory:
-            prompt += "\nLEARNINGS FROM PREVIOUS MUTATIONS:\n"
-            
-            for idx, item in enumerate(self.evolution_memory):
-                success_str = "SUCCESSFUL" if item["success"] else "UNSUCCESSFUL"
-                impact_str = ", ".join([f"{k}: {v:+.4f}" for k, v in item["impact"].items()])
-                
-                prompt += f"{idx+1}. [{success_str}] Component: {item['component']}\n"
-                prompt += f"   Impact: {impact_str}\n"
-                prompt += f"   Mutation: {item['mutation']}\n\n"
-                
-            prompt += "ANALYSIS OF PREVIOUS MUTATIONS:\n"
-            prompt += "1. What patterns do you observe in successful mutations?\n"
-            prompt += "2. What should be avoided based on unsuccessful mutations?\n"
-            prompt += "3. How can you build upon or combine successful strategies?\n\n"
-        
-        prompt += """INSTRUCTIONS:
-1. Analyze the current implementation and identify areas for improvement
-2. Consider learnings from previous mutations (if available)
-3. Generate a specific, targeted improvement
-4. Explain your reasoning
-5. Provide the exact code that should replace the current implementation
-
-YOUR EVOLVED IMPLEMENTATION:
-```python
-"""
-        
-        return prompt
-    
-    def _extract_mutation(self, response: str) -> str:
-        """Extract the mutation code from the LLM response."""
-        if "```python" in response and "```" in response:
-            # Extract code between python code blocks
-            code_start = response.find("```python") + 9
-            code_end = response.find("```", code_start)
-            return response[code_start:code_end].strip()
-        
-        # Fall back to a simple extraction approach
-        lines = response.split('\n')
-        in_code_block = False
-        code_lines = []
-        
-        for line in lines:
-            if line.strip() == "```python" or line.strip() == "```":
-                in_code_block = not in_code_block
-                continue
-                
-            if in_code_block:
-                code_lines.append(line)
-                
-        return "\n".join(code_lines)
-    
-    def _template_based_mutation(self, component: str, current_code: str) -> str:
-        """
-        Fallback mutation generator when LLM is not available.
-        
-        Args:
-            component: Component to modify
-            current_code: Current implementation
-            
-        Returns:
-            Proposed mutation
-        """
-        # Very basic template-based mutation for fallback
-        return current_code
+    def get_architecture_trend(self, component: str) -> Dict:
+        """Analyze architecture evolution trend for a component."""
+        metrics = {}
+        for metric in ["val_accuracy", "flops", "params"]:
+            key = f"{component}_{metric}"
+            if key in self.performance_metrics:
+                values = self.performance_metrics[key]
+                if len(values) >= 2:
+                    trend = np.polyfit(range(len(values)), values, 1)[0]
+                    metrics[f"{metric}_trend"] = trend
+                    
+        return metrics
 
 class SelfEvolutionController:
-    """
-    Controller for system self-evolution.
+    """Controls and coordinates system-wide evolution."""
     
-    This class manages the evolution process, including generating and
-    applying improvements, evaluating system performance, and tracking
-    evolution metrics.
-    """
-    
-    def __init__(self, system: Any, model_name: str = "meta-llama/Llama-3.2-3B"):
-        """
-        Initialize the self-evolution controller.
+    def __init__(self,
+                memory_system,
+                retrieval_system,
+                debate_system,
+                config: Optional[Dict] = None):
+        self.memory_system = memory_system
+        self.retrieval_system = retrieval_system
+        self.debate_system = debate_system
         
-        Args:
-            system: System to evolve
-            model_name: Name of the LLM model to use for guided evolution
-        """
-        self.system = system
+        self.config = config or {}
         self.metrics = EvolutionMetrics()
-        self.evaluator = SystemEvaluator()
-        self.generator = ImprovementGenerator()
-        self.selector = ImprovementSelector()
-        self.improvements = []
-        self.applied_improvements = []
-        self.rejected_improvements = []
+        self.evolution_state = "idle"
         
-        # Add the LLM-guided evolution component
-        self.llm_evolution = LLMGuidedEvolution(model_name=model_name)
+        # Component optimizers
+        self.memory_optimizer = None
+        self.retrieval_optimizer = None
+        self.debate_optimizer = None
         
-        # Try to detect device
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.compression_performance = CompressionPerformance()
+        self.architecture_evolution = ArchitectureEvolution()
         
-        logger.info(f"Self-evolution controller initialized (using {self.device})")
+        # Initialize NAS components
+        self.memory_nas = EnhancedNeuralArchitectureEvolution(
+            input_shape=self.config.get("memory_input_shape", (768,)),
+            population_size=self.config.get("nas_population_size", 10),
+            evolution_cycles=self.config.get("nas_evolution_cycles", 5)
+        )
         
-    def run_evolution_cycle(self, 
-                         max_improvements: int = 1,
-                         generation_count: int = 5,
-                         use_llm_guidance: bool = True) -> Dict:
-        """
-        Run a single evolution cycle.
+        self.retrieval_nas = EnhancedNeuralArchitectureEvolution(
+            input_shape=self.config.get("retrieval_input_shape", (768,)),
+            population_size=self.config.get("nas_population_size", 10),
+            evolution_cycles=self.config.get("nas_evolution_cycles", 5)
+        )
         
-        Args:
-            max_improvements: Maximum number of improvements to apply
-            generation_count: Number of candidate improvements to generate
-            use_llm_guidance: Whether to use LLM-guided evolution
-            
-        Returns:
-            Dictionary with cycle results
-        """
-        cycle_start = time.time()
+        self._initialize_optimizers()
         
+    def _initialize_optimizers(self):
+        """Initialize multi-objective Bayesian optimizers for each component."""
+        # Memory system optimization parameters and objectives
+        memory_params = {
+            "compression_ratio": (0.1, 0.5),
+            "cache_size": (100, 10000),
+            "pruning_threshold": (0.1, 0.9)
+        }
+        self.memory_optimizer = MultiObjectiveBayesianOptimizer(
+            parameter_ranges=memory_params,
+            n_objectives=4,  # accuracy, efficiency, adaptability, compression
+            weights=[0.3, 0.3, 0.2, 0.2]
+        )
+        
+        # Retrieval system optimization parameters and objectives
+        retrieval_params = {
+            "sparse_weight": (0.2, 0.8),
+            "top_k": (3, 20),
+            "min_similarity": (0.1, 0.5)
+        }
+        self.retrieval_optimizer = MultiObjectiveBayesianOptimizer(
+            parameter_ranges=retrieval_params,
+            n_objectives=3,  # accuracy, efficiency, adaptability
+            weights=[0.5, 0.3, 0.2]
+        )
+        
+        # Debate system optimization parameters and objectives
+        debate_params = {
+            "num_rounds": (2, 10),
+            "consensus_threshold": (0.6, 0.9),
+            "diversity_weight": (0.1, 0.5)
+        }
+        self.debate_optimizer = MultiObjectiveBayesianOptimizer(
+            parameter_ranges=debate_params,
+            n_objectives=3,  # accuracy, efficiency, adaptability
+            weights=[0.4, 0.3, 0.3]
+        )
+        
+    def trigger_evolution_cycle(self) -> Dict:
+        """Trigger a system-wide evolution cycle with error recovery."""
+        logger.info("Starting system evolution cycle")
+        self.evolution_state = "active"
+        
+        cycle_results = {
+            "status": "error",
+            "timestamp": time.time(),
+            "components": {}
+        }
+
         try:
-            logger.info("Starting evolution cycle")
+            # Validate components first
+            validations = self.validate_system_components()
+            if not all(validations.values()):
+                invalid = [k for k, v in validations.items() if not v]
+                raise ValueError(f"System validation failed for: {invalid}")
+
+            # Collect current metrics
+            metrics = self._collect_system_metrics()
             
-            # Step 1: Evaluate current system
-            current_metrics = self.evaluator.evaluate(self.system)
-            logger.info(f"Current system metrics: {current_metrics}")
+            # Optimize each component with error handling
+            components = ["memory", "retrieval", "debate"]
             
-            # Step 2: Generate improvements
-            if use_llm_guidance and hasattr(self, 'llm_evolution'):
-                logger.info("Using LLM-guided evolution to generate improvements")
-                
-                # Get code for each component
-                components = self._get_system_components()
-                
-                candidate_improvements = []
-                for component_name, component_code in components.items():
-                    # Generate an improvement with LLM guidance
-                    mutation = self.llm_evolution.generate_mutation(
-                        component=component_name,
-                        current_code=component_code,
-                        target_metrics=list(current_metrics.keys())
-                    )
-                    
-                    improvement = Improvement(
-                        component=component_name,
-                        description=f"LLM-guided improvement for {component_name}",
-                        implementation=mutation
-                    )
-                    
-                    candidate_improvements.append(improvement)
-            else:
-                # Fall back to original improvement generation logic
-                logger.info(f"Generating {generation_count} candidate improvements")
-                candidate_improvements = self.generator.generate_improvements(
-                    self.system, 
-                    self.evaluator,
-                    count=generation_count
-                )
-            
-            # Step 3: Select improvements to apply
-            logger.info(f"Selecting up to {max_improvements} improvements to apply")
-            selected_improvements = self.selector.select_improvements(
-                candidate_improvements,
-                max_count=max_improvements
-            )
-            
-            # Step 4: Apply improvements
-            improvements_applied = 0
-            for improvement in selected_improvements:
-                logger.info(f"Applying improvement: {improvement.description}")
-                
-                # Record metrics before applying
-                before_metrics = self.evaluator.evaluate(self.system)
-                
-                # Apply the improvement
+            for component in components:
                 try:
-                    # This would implement the actual code changes
-                    # For prototype, we just mark it as applied
-                    improvement.apply()
-                    improvements_applied += 1
-                    self.applied_improvements.append(improvement)
-                    
-                    # Evaluate impact
-                    after_metrics = self.evaluator.evaluate(self.system)
-                    improvement.record_impact(after_metrics)
-                    
-                    # Record for Evolution of Thought
-                    if hasattr(self, 'llm_evolution'):
-                        self.llm_evolution.record_mutation(
-                            component=improvement.component,
-                            mutation=improvement.implementation,
-                            metrics_before=before_metrics,
-                            metrics_after=after_metrics,
-                            success=True  # Assume success for now
-                        )
-                        
-                    logger.info(f"Improvement applied successfully")
+                    optimizer_func = getattr(self, f"_optimize_{component}")
+                    results = optimizer_func()
+                    cycle_results["components"][component] = {
+                        "status": "success",
+                        "results": results
+                    }
                 except Exception as e:
-                    logger.error(f"Error applying improvement: {e}")
-                    improvement.reject(f"Error during application: {e}")
-                    self.rejected_improvements.append(improvement)
-                    
-                    # Record failed attempt for Evolution of Thought
-                    if hasattr(self, 'llm_evolution'):
-                        self.llm_evolution.record_mutation(
-                            component=improvement.component,
-                            mutation=improvement.implementation,
-                            metrics_before=before_metrics,
-                            metrics_after=before_metrics,  # No change
-                            success=False
-                        )
+                    error_info = self.handle_evolution_error(e, component)
+                    cycle_results["components"][component] = {
+                        "status": "error",
+                        "error_info": error_info
+                    }
+
+            # Update evolution history
+            self.metrics.evolution_history.append(cycle_results)
             
-            # Step 5: Record cycle metrics
-            cycle_duration = time.time() - cycle_start
-            final_metrics = self.evaluator.evaluate(self.system)
+            # Check if any components succeeded
+            successful = any(comp["status"] == "success" for comp in cycle_results["components"].values())
+            if successful:
+                cycle_results["status"] = "partial_success" if "error" in str(cycle_results) else "success"
             
-            self.metrics.record_cycle(
-                metrics=final_metrics,
-                duration=cycle_duration,
-                improvements=improvements_applied
-            )
-            
-            logger.info(f"Evolution cycle completed in {cycle_duration:.2f} seconds")
-            logger.info(f"Applied {improvements_applied} improvements")
-            
-            return {
-                "cycle_duration": cycle_duration,
-                "improvements_applied": improvements_applied,
-                "metrics_before": current_metrics,
-                "metrics_after": final_metrics
-            }
-            
+            self.evolution_state = "idle"
+            return cycle_results
+
         except Exception as e:
-            cycle_duration = time.time() - cycle_start
-            logger.error(f"Error during evolution cycle: {e}")
-            logger.error(traceback.format_exc())
-            
+            logger.error(f"Evolution cycle failed: {str(e)}")
+            self.evolution_state = "error"
             return {
-                "cycle_duration": cycle_duration,
+                "status": "error",
                 "error": str(e),
-                "success": False
+                "timestamp": time.time()
             }
-    
-    def _get_system_components(self) -> Dict[str, str]:
-        """
-        Get the code for each system component.
-        
-        In a real implementation, this would extract actual code.
-        For the prototype, we return dummy code.
-        
-        Returns:
-            Dictionary mapping component names to code
-        """
-        # This would be implemented to extract actual code from components
-        # For prototype, return dummy implementations
-        return {
-            "memory": "class Memory:\n    def __init__(self):\n        self.data = {}\n",
-            "retrieval": "class Retrieval:\n    def search(self, query):\n        return []\n",
-            "evolution": "class Evolution:\n    def evolve(self):\n        pass\n"
+
+    def handle_evolution_error(self, error: Exception, component: str) -> Dict:
+        """Handle and log evolution errors with appropriate recovery actions."""
+        error_info = {
+            "component": component,
+            "error": str(error),
+            "timestamp": time.time(),
+            "recovery_action": None
         }
-        
-    def run_evolution_cycles(self, 
-                          cycles: int = 3,
-                          max_improvements_per_cycle: int = 1) -> Dict:
-        """
-        Run multiple evolution cycles.
-        
-        Args:
-            cycles: Number of evolution cycles to run
-            max_improvements_per_cycle: Maximum improvements per cycle
-            
-        Returns:
-            Dictionary with evolution results
-        """
-        results = []
-        
-        for _ in range(cycles):
-            cycle_result = self.run_evolution_cycle(
-                max_improvements=max_improvements_per_cycle
-            )
-            results.append(cycle_result)
-            
-        # Get overall metrics
-        summary = self.metrics.get_summary()
-        
-        return {
-            "cycles": results,
-            "summary": summary
-        }
-        
-    def get_applied_improvements(self) -> List[Improvement]:
-        """
-        Get list of applied improvements.
-        
-        Returns:
-            List of applied improvements
-        """
-        return [imp for imp in self.improvements if imp.applied]
-        
-    def get_rejected_improvements(self) -> List[Improvement]:
-        """
-        Get list of rejected improvements.
-        
-        Returns:
-            List of rejected improvements
-        """
-        return [imp for imp in self.improvements if imp.rejected]
-        
-    def get_improvement_history(self) -> List[Dict]:
-        """
-        Get history of all improvements.
-        
-        Returns:
-            List of improvement dictionaries
-        """
-        return [imp.to_dict() for imp in self.improvements]
-        
-    def save_state(self, path: str):
-        """
-        Save controller state to file.
-        
-        Args:
-            path: Path to save state
-        """
-        state = {
-            "metrics": self.metrics.to_dict(),
-            "improvements": [imp.to_dict() for imp in self.improvements],
-            "applied_improvements": self.applied_improvements
-        }
-        
-        with open(path, 'w') as f:
-            json.dump(state, f, indent=2)
-            
-        logger.info(f"Saved evolution state to {path}")
-        
-    def load_state(self, path: str) -> bool:
-        """
-        Load controller state from file.
-        
-        Args:
-            path: Path to load state from
-            
-        Returns:
-            True if loaded successfully, False otherwise
-        """
+
         try:
-            with open(path, 'r') as f:
-                state = json.load(f)
+            if "out of memory" in str(error):
+                self._cleanup_component_memory(component)
+                error_info["recovery_action"] = "memory_cleanup"
+            elif "convergence" in str(error):
+                self._reset_component_config(component)
+                error_info["recovery_action"] = "reset_config"
+            else:
+                self._restart_component(component)
+        
+        # Get next set of parameters to try
+        params = self.memory_optimizer.suggest_params_multi()
+        
+        # Apply parameters
+        self.memory_system.update_configuration(params)
+        
+        # Record compression performance
+        compression_stats = self.memory_system.get_compression_statistics()
+        self.compression_performance.add_metric(
+            compression_ratio=compression_stats["compression_ratio"],
+            reconstruction_loss=compression_stats["reconstruction_loss"],
+            processing_time=compression_stats["processing_time"],
+            memory_saved=compression_stats["memory_saved"]
+        )
+        
+        # Evaluate new performance with compression metrics
+        new_metrics = self._collect_system_metrics()["memory"]
+        compression_avg = self.compression_performance.get_average_metrics()
+        
+        # Update optimizer with multiple objectives
+        objective_values = [
+            new_metrics.accuracy,
+            new_metrics.efficiency,
+            new_metrics.adaptability,
+            compression_avg.get("avg_compression_ratio", 0.0)
+        ]
+        
+        self.memory_optimizer.update_multi(params, objective_values)
+        
+        results = {
+            "old_metrics": current_metrics,
+            "new_metrics": new_metrics,
+            "compression_metrics": compression_avg,
+            "parameters": params,
+            "pareto_front": self.memory_optimizer.get_pareto_front()
+        }
+        
+        # Run neural architecture search if data is available
+        if hasattr(self.memory_system, "get_training_data"):
+            train_data, val_data = self.memory_system.get_training_data()
+            
+            # Create data loaders
+            train_loader = torch.utils.data.DataLoader(
+                train_data, batch_size=32, shuffle=True
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_data, batch_size=32, shuffle=False
+            )
+            
+            # Run architecture search
+            best_architecture = self.memory_nas.run_evolution(
+                train_loader=train_loader,
+                val_loader=val_loader
+            )
+            
+            # Record architecture evolution results
+            self.architecture_evolution.add_architecture_result(
+                component="memory",
+                architecture=best_architecture,
+                performance={
+                    "val_accuracy": best_architecture["val_accuracy"],
+                    "flops": best_architecture["flops"],
+                    "params": best_architecture["params"]
+                }
+            )
+            
+            # Update results with architecture information
+            results["architecture"] = {
+                "config": best_architecture,
+                "performance": self.architecture_evolution.get_architecture_trend("memory")
+            }
+            
+        return results
+        
+    def _optimize_memory(self) -> Dict:
+        """Optimize memory system using multi-objective optimization."""
+        # Get current metrics before optimization
+        current_metrics = self.metrics.get_component_trend("memory")
+        
+        # Get next set of parameters to try
+        params = self.memory_optimizer.suggest_params_multi()
+        
+        # Apply parameters
+        self.memory_system.update_configuration(params)
+        
+        # Record compression performance
+        compression_stats = self.memory_system.get_compression_statistics()
+        self.compression_performance.add_metric(
+            compression_ratio=compression_stats["compression_ratio"],
+            reconstruction_loss=compression_stats["reconstruction_loss"],
+            processing_time=compression_stats["processing_time"],
+            memory_saved=compression_stats["memory_saved"]
+        )
+        
+        # Evaluate new performance with compression metrics
+        new_metrics = self._collect_system_metrics()["memory"]
+        compression_avg = self.compression_performance.get_average_metrics()
+        
+        # Update optimizer with multiple objectives
+        objective_values = [
+            new_metrics.accuracy,
+            new_metrics.efficiency,
+            new_metrics.adaptability,
+            compression_avg.get("avg_compression_ratio", 0.0)
+        ]
+        
+        self.memory_optimizer.update_multi(params, objective_values)
+        
+        results = {
+            "old_metrics": current_metrics,
+            "new_metrics": new_metrics,
+            "compression_metrics": compression_avg,
+            "parameters": params,
+            "pareto_front": self.memory_optimizer.get_pareto_front()
+        }
+        
+        # Run neural architecture search if data is available
+        if hasattr(self.memory_system, "get_training_data"):
+            train_data, val_data = self.memory_system.get_training_data()
+            
+            # Create data loaders
+            train_loader = torch.utils.data.DataLoader(
+                train_data, batch_size=32, shuffle=True
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_data, batch_size=32, shuffle=False
+            )
+            
+            # Run architecture search
+            best_architecture = self.memory_nas.run_evolution(
+                train_loader=train_loader,
+                val_loader=val_loader
+            )
+            
+            # Record architecture evolution results
+            self.architecture_evolution.add_architecture_result(
+                component="memory",
+                architecture=best_architecture,
+                performance={
+                    "val_accuracy": best_architecture["val_accuracy"],
+                    "flops": best_architecture["flops"],
+                    "params": best_architecture["params"]
+                }
+            )
+            
+            # Update results with architecture information
+            results["architecture"] = {
+                "config": best_architecture,
+                "performance": self.architecture_evolution.get_architecture_trend("memory")
+            }
+            
+        return results
+        
+    def _optimize_retrieval(self) -> Dict:
+        """Optimize retrieval system using multi-objective optimization."""
+        current_metrics = self.metrics.get_component_trend("retrieval")
+        
+        # Get next set of parameters to try
+        params = self.retrieval_optimizer.suggest_params_multi()
+        
+        # Apply parameters
+        self.retrieval_system.update_configuration(params)
+        
+        # Evaluate new performance
+        new_metrics = self._collect_system_metrics()["retrieval"]
+        
+        # Update optimizer with multiple objectives
+        objective_values = [
+            new_metrics.accuracy,
+            new_metrics.efficiency,
+            new_metrics.adaptability
+        ]
+        self.retrieval_optimizer.update_multi(params, objective_values)
+        
+        results = {
+            "old_metrics": current_metrics,
+            "new_metrics": new_metrics,
+            "parameters": params,
+            "pareto_front": self.retrieval_optimizer.get_pareto_front()
+        }
+        
+        # Run neural architecture search if data is available
+        if hasattr(self.retrieval_system, "get_training_data"):
+            train_data, val_data = self.retrieval_system.get_training_data()
+            
+            train_loader = torch.utils.data.DataLoader(
+                train_data, batch_size=32, shuffle=True
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_data, batch_size=32, shuffle=False
+            )
+            
+            best_architecture = self.retrieval_nas.run_evolution(
+                train_loader=train_loader,
+                val_loader=val_loader
+            )
+            
+            self.architecture_evolution.add_architecture_result(
+                component="retrieval",
+                architecture=best_architecture,
+                performance={
+                    "val_accuracy": best_architecture["val_accuracy"],
+                    "flops": best_architecture["flops"],
+                    "params": best_architecture["params"]
+                }
+            )
+            
+            results["architecture"] = {
+                "config": best_architecture,
+                "performance": self.architecture_evolution.get_architecture_trend("retrieval")
+            }
+            
+        return results
+        
+    def _optimize_debate(self) -> Dict:
+        """Optimize debate system using multi-objective optimization."""
+        current_metrics = self.metrics.get_component_trend("debate")
+        
+        # Get next set of parameters to try
+        params = self.debate_optimizer.suggest_params_multi()
+        
+        # Apply parameters
+        self.debate_system.update_configuration(params)
+        
+        # Evaluate new performance
+        new_metrics = self._collect_system_metrics()["debate"]
+        
+        # Update optimizer with multiple objectives
+        objective_values = [
+            new_metrics.accuracy,
+            new_metrics.efficiency,
+            new_metrics.adaptability
+        ]
+        self.debate_optimizer.update_multi(params, objective_values)
+        
+        return {
+            "old_metrics": current_metrics,
+            "new_metrics": new_metrics,
+            "parameters": params,
+            "pareto_front": self.debate_optimizer.get_pareto_front()
+        }
+        
+    def _analyze_improvements(self, cycle_results: Dict) -> Dict:
+        """Analyze improvements from evolution cycle."""
+        improvements = {}
+        
+        for component in ["memory", "retrieval", "debate"]:
+            old_metrics = cycle_results[component]["old_metrics"]
+            new_metrics = cycle_results[component]["new_metrics"]
+            
+            if not old_metrics:  # First evolution cycle
+                continue
                 
-            # Load metrics
-            if "metrics" in state:
-                self.metrics = EvolutionMetrics.from_dict(state["metrics"])
-                
-            # Load improvements
-            if "improvements" in state:
-                self.improvements = [
-                    Improvement.from_dict(imp_data)
-                    for imp_data in state["improvements"]
-                ]
-                
-            # Load applied improvements
-            if "applied_improvements" in state:
-                self.applied_improvements = state["applied_improvements"]
-                
-            logger.info(f"Loaded evolution state from {path}")
+            improvements[component] = {
+                "accuracy_change": new_metrics.accuracy - old_metrics["accuracy_trend"],
+                "efficiency_change": new_metrics.efficiency - old_metrics["efficiency_trend"],
+                "adaptability_change": new_metrics.adaptability - old_metrics["adaptability_trend"]
+            }
+            
+        return improvements
+        
+    def get_evolution_status(self) -> Dict:
+        """Get current evolution status and metrics."""
+        return {
+            "state": self.evolution_state,
+            "last_cycle": self.metrics.evolution_history[-1] if self.metrics.evolution_history else None,
+            "component_trends": {
+                "memory": self.metrics.get_component_trend("memory"),
+                "retrieval": self.metrics.get_component_trend("retrieval"),
+                "debate": self.metrics.get_component_trend("debate")
+            }
+        }
+        
+    def get_compression_status(self) -> Dict:
+        """Get detailed compression performance metrics."""
+        return {
+            "current_performance": self.compression_performance.get_average_metrics(),
+            "optimization_trend": self._analyze_compression_trend()
+        }
+        
+    def _analyze_compression_trend(self) -> Dict:
+        """Analyze compression performance trend."""
+        if not self.compression_performance.compression_ratios:
+            return {}
+            
+        # Get last 10 measurements
+        recent_ratios = self.compression_performance.compression_ratios[-10:]
+        recent_losses = self.compression_performance.reconstruction_losses[-10:]
+        
+        return {
+            "compression_trend": np.polyfit(range(len(recent_ratios)), recent_ratios, 1)[0],
+            "quality_trend": np.polyfit(range(len(recent_losses)), recent_losses, 1)[0],
+            "samples_analyzed": len(recent_ratios)
+        }
+        
+    def get_architecture_status(self) -> Dict:
+        """Get status of architecture evolution."""
+        return {
+            "best_architectures": self.architecture_evolution.best_architectures,
+            "trends": {
+                "memory": self.architecture_evolution.get_architecture_trend("memory"),
+                "retrieval": self.architecture_evolution.get_architecture_trend("retrieval")
+            },
+            "history_length": len(self.architecture_evolution.architecture_history)
+        }
+
+    def save_state(self, path: str):
+        """Save evolution state and metrics."""
+        state = {
+            "metrics": self.metrics,
+            "memory_optimizer": self.memory_optimizer.get_state(),
+            "retrieval_optimizer": self.retrieval_optimizer.get_state(),
+            "debate_optimizer": self.debate_optimizer.get_state(),
+            "architecture_evolution": self.architecture_evolution,
+            "config": self.config
+        }
+        torch.save(state, path)
+        
+    def load_state(self, path: str):
+        """Load evolution state and metrics."""
+        state = torch.load(path)
+        self.metrics = state["metrics"]
+        self.memory_optimizer.load_state(state["memory_optimizer"])
+        self.retrieval_optimizer.load_state(state["retrieval_optimizer"])
+        self.debate_optimizer.load_state(state["debate_optimizer"])
+        self.architecture_evolution = state["architecture_evolution"]
+        self.config = state["config"]
+
+    def validate_system_components(self) -> Dict[str, bool]:
+        """Validate that all required system components are properly initialized."""
+        validations = {
+            "memory": self._validate_memory_system(),
+            "retrieval": self._validate_retrieval_system(),
+            "debate": self._validate_debate_system(),
+            "optimizers": self._validate_optimizers()
+        }
+        return validations
+        
+    def _validate_memory_system(self) -> bool:
+        """Validate memory system configuration and capabilities."""
+        try:
+            # Check required methods
+            required_methods = [
+                "get_statistics",
+                "get_compression_statistics",
+                "update_configuration"
+            ]
+            
+            for method in required_methods:
+                if not hasattr(self.memory_system, method):
+                    logger.error(f"Memory system missing required method: {method}")
+                    return False
+                    
+            # Validate compression capabilities
+            compression_stats = self.memory_system.get_compression_statistics()
+            required_stats = ["compression_ratio", "reconstruction_loss", 
+                            "processing_time", "memory_saved"]
+                            
+            for stat in required_stats:
+                if stat not in compression_stats:
+                    logger.error(f"Memory system missing compression stat: {stat}")
+                    return False
+                    
             return True
             
         except Exception as e:
-            logger.error(f"Failed to load evolution state: {e}")
-            logger.error(traceback.format_exc())
+            logger.error(f"Memory system validation failed: {str(e)}")
             return False
-
-# Example usage
-def example_usage():
-    """Demonstrate usage of the self-evolution controller."""
-    # Create a mock system
-    class MockSystem:
-        def __init__(self):
-            self.components = {
-                "memory": {"count": 100},
-                "retrieval": {"queries": 0},
-                "entity_graph": {"entities": 0}
-            }
             
-        def get_status(self):
-            return {
-                "system": {
-                    "components": list(self.components.keys())
-                },
-                "memory": {
-                    "volatile_items": 50,
-                    "archival_items": 50,
-                    "total_items": 100
-                }
-            }
-    
-    # Create controller
-    system = MockSystem()
-    controller = SelfEvolutionController(system)
-    
-    # Run evolution cycles
-    results = controller.run_evolution_cycles(cycles=3, max_improvements_per_cycle=2)
-    
-    print("\nEvolution Results:")
-    print(f"Cycles completed: {results['summary']['cycles_completed']}")
-    print(f"Improvements applied: {results['summary']['improvements_applied']}")
-    print(f"Average cycle duration: {results['summary']['average_cycle_duration']:.2f}s")
-    
-    # Print performance trends
-    print("\nPerformance Trends:")
-    for metric, trend in results['summary']['performance_trends'].items():
-        direction = "improved" if trend > 0 else "declined"
-        print(f"  {metric}: {direction} by {abs(trend):.4f}")
-    
-    # Print applied improvements
-    print("\nApplied Improvements:")
-    for improvement in controller.get_applied_improvements():
-        print(f"  - {improvement.description}")
+    def _validate_retrieval_system(self) -> bool:
+        """Validate retrieval system configuration and capabilities."""
+        try:
+            # Check required methods
+            required_methods = [
+                "get_statistics",
+                "update_configuration"
+            ]
+            
+            for method in required_methods:
+                if not hasattr(self.retrieval_system, method):
+                    logger.error(f"Retrieval system missing required method: {method}")
+                    return False
+                    
+            # Validate retrieval capabilities
+            stats = self.retrieval_system.get_statistics()
+            required_stats = ["search_accuracy", "avg_search_time", "learning_rate"]
+            
+            for stat in required_stats:
+                if stat not in stats:
+                    logger.error(f"Retrieval system missing stat: {stat}")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Retrieval system validation failed: {str(e)}")
+            return False
+            
+    def _validate_debate_system(self) -> bool:
+        """Validate debate system configuration and capabilities."""
+        try:
+            # Check required methods
+            required_methods = [
+                "get_statistics",
+                "update_configuration"
+            ]
+            
+            for method in required_methods:
+                if not hasattr(self.debate_system, method):
+                    logger.error(f"Debate system missing required method: {method}")
+                    return False
+                    
+            # Validate debate capabilities
+            stats = self.debate_system.get_statistics()
+            required_stats = ["consensus_rate", "avg_resolution_time", "innovation_rate"]
+            
+            for stat in required_stats:
+                if stat not in stats:
+                    logger.error(f"Debate system missing stat: {stat}")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Debate system validation failed: {str(e)}")
+            return False
+            
+    def _validate_optimizers(self) -> bool:
+        """Validate optimizer configurations."""
+        try:
+            optimizers = [
+                (self.memory_optimizer, "Memory"),
+                (self.retrieval_optimizer, "Retrieval"),
+                (self.debate_optimizer, "Debate")
+            ]
+            
+            for optimizer, name in optimizers:
+                if optimizer is None:
+                    logger.error(f"{name} optimizer not initialized")
+                    return False
+                    
+                if not hasattr(optimizer, "suggest_params_multi"):
+                    logger.error(f"{name} optimizer missing multi-objective capabilities")
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            logger.error(f"Optimizer validation failed: {str(e)}")
+            return False
+            
+    def handle_evolution_error(self, error: Exception, component: str) -> Dict:
+        """Handle and log evolution errors with appropriate recovery actions."""
+        error_info = {
+            "component": component,
+            "error": str(error),
+            "timestamp": time.time(),
+            "recovery_action": None
+        }
         
-    return controller, results
-
-if __name__ == "__main__":
-    example_usage() 
+        try:
+            if isinstance(error, ValueError):
+                # Configuration error
+                error_info["recovery_action"] = "reset_config"
+                self._reset_component_config(component)
+            elif isinstance(error, RuntimeError):
+                # Runtime error
+                error_info["recovery_action"] = "restart_component"
+                self._restart_component(component)
+            else:
+                # Unknown error
+                error_info["recovery_action"] = "log_only"
+                
+            logger.error(f"Evolution error in {component}: {str(error)}")
+            logger.info(f"Recovery action: {error_info['recovery_action']}")
+            
+            # Add to error history
+            self.metrics.optimization_history[component].append(error_info)
+            
+        except Exception as recovery_error:
+            logger.error(f"Error recovery failed: {str(recovery_error)}")
+            error_info["recovery_failed"] = True
+            
+        return error_info
+        
+    def _reset_component_config(self, component: str):
+        """Reset component configuration to default values."""
+        default_configs = {
+            "memory": {
+                "compression_ratio": 0.3,
+                "cache_size": 1000,
+                "pruning_threshold": 0.5
+            },
+            "retrieval": {
+                "sparse_weight": 0.5,
+                "top_k": 10,
+                "min_similarity": 0.3
+            },
+            "debate": {
+                "num_rounds": 5,
+                "consensus_threshold": 0.7,
+                "diversity_weight": 0.3
+            }
+        }
+        
+        if component in default_configs:
+            system = getattr(self, f"{component}_system")
+            system.update_configuration(default_configs[component])
+            logger.info(f"Reset {component} configuration to defaults")
+            
+    def _restart_component(self, component: str):
+        """Attempt to restart a component after runtime error."""
+        try:
+            system = getattr(self, f"{component}_system")
+            if hasattr(system, "restart"):
+                system.restart()
+                logger.info(f"Successfully restarted {component} system")
+            else:
+                logger.warning(f"No restart method available for {component} system")
+                
+        except Exception as e:
+            logger.error(f"Failed to restart {component} system: {str(e)}")
+            raise

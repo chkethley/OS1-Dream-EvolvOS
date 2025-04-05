@@ -800,6 +800,15 @@ class EnhancedVSACommunicationBus:
         self.active_dialogues = {}
         self.semantic_index = defaultdict(list)  # Maps concepts to messages
         
+        # Enhanced message routing
+        self.priority_queues = {
+            "high": [],
+            "medium": [],
+            "low": []
+        }
+        self.batch_size = 32
+        self.batch_buffer = []
+        
     def register_agent(self, agent_id: str) -> HDVector:
         """
         Register an agent with the communication bus.
@@ -936,56 +945,47 @@ class EnhancedVSACommunicationBus:
         
         return message
         
-    def publish(self, message: VSAMessage) -> str:
+    def publish(self, message: VSAMessage, priority: str = "medium") -> str:
         """
         Publish a message to the communication bus.
         
         Args:
             message: VSA message to publish
+            priority: Priority level (high, medium, low)
             
         Returns:
             Message ID
         """
-        # Add to message list
-        self.messages.append(message)
+        # Add to appropriate priority queue
+        self.priority_queues[priority].append(message)
         
-        # Index for semantic search
-        for role, filler in message.content.items():
-            self.semantic_index[filler].append(message.id)
+        # Add to batch buffer
+        self.batch_buffer.append(message)
+        
+        # Process batch if buffer is full
+        if len(self.batch_buffer) >= self.batch_size:
+            self._process_message_batch()
             
         return message.id
-    
-    def start_dialogue(self, topic: str, participants: List[str]) -> str:
-        """
-        Start a new dialogue.
         
-        Args:
-            topic: Dialogue topic
-            participants: List of participant agent IDs
+    def _process_message_batch(self):
+        """Process a batch of messages efficiently."""
+        if not self.batch_buffer:
+            return
             
-        Returns:
-            Dialogue ID
-        """
-        dialogue_id = str(uuid.uuid4())
+        # Create batched vectors for efficient processing
+        vectors = torch.stack([msg.vector for msg in self.batch_buffer if msg.vector is not None])
         
-        # Register topic
-        topic_vector = self.register_topic(topic)
+        # Perform batched operations
+        for msg in self.batch_buffer:
+            self.messages.append(msg)
+            # Index message concepts
+            for role, filler in msg.content.items():
+                self.semantic_index[filler].append(msg.id)
+                
+        # Clear batch buffer
+        self.batch_buffer = []
         
-        # Create dialogue
-        dialogue = {
-            "id": dialogue_id,
-            "topic": topic,
-            "topic_vector": topic_vector,
-            "participants": participants,
-            "messages": [],
-            "state": "active",
-            "created_at": time.time()
-        }
-        
-        self.active_dialogues[dialogue_id] = dialogue
-        
-        return dialogue_id
-    
     def add_to_dialogue(self, dialogue_id: str, message: VSAMessage) -> bool:
         """
         Add a message to a dialogue.
@@ -1025,19 +1025,25 @@ class EnhancedVSACommunicationBus:
         Returns:
             List of similar messages
         """
-        if not self.messages:
-            return []
+        # Process any pending messages
+        if self.batch_buffer:
+            self._process_message_batch()
             
-        # Calculate similarities
-        similarities = [(message, message.vector.similarity(query_vector)) 
-                       for message in self.messages 
-                       if message.vector is not None]
-        
-        # Sort by similarity
-        sorted_messages = sorted(similarities, key=lambda x: x[1], reverse=True)
-        
-        # Return top-k
-        return [message for message, _ in sorted_messages[:top_k]]
+        # Process high priority messages first
+        results = []
+        for priority in ["high", "medium", "low"]:
+            queue = self.priority_queues[priority]
+            if not queue:
+                continue
+                
+            # Calculate similarities for this priority level
+            similarities = [(msg, msg.vector.similarity(query_vector)) 
+                          for msg in queue if msg.vector is not None]
+            results.extend(similarities)
+            
+        # Sort and return top results
+        sorted_msgs = sorted(results, key=lambda x: x[1], reverse=True)
+        return [msg for msg, _ in sorted_msgs[:top_k]]
     
     def search_by_content(self, content: str, top_k: int = 5) -> List[Tuple[VSAMessage, float]]:
         """

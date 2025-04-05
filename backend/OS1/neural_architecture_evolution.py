@@ -4,23 +4,16 @@ Neural Architecture Evolution
 This module implements neural architecture evolution for EvolvOS, enabling the system
 to automatically discover and optimize neural network architectures through evolutionary algorithms.
 """
-
-import os
-import sys
-import time
-import json
+from typing import Dict, List, Any, Optional, Tuple, Callable, Set
 import logging
-import random
 import uuid
 import copy
-from typing import Dict, List, Any, Optional, Tuple, Callable, Set
-import numpy as np
-
-# Add new imports for model merging
+import random
 import torch
 import torch.nn as nn
+
+# Add new imports for model merging
 from dataclasses import dataclass
-import heapq
 
 logger = logging.getLogger("EvolvOS.NeuralEvolution")
 
@@ -1465,4 +1458,4 @@ if __name__ == "__main__":
     example_usage()
     
     print("\nRunning Evolutionary Model Merging example:")
-    example_evolutionary_merging() 
+    example_evolutionary_merging()

@@ -1,727 +1,400 @@
 """
-Bayesian Optimizer
-
-This module implements Bayesian optimization for hyperparameter tuning
-in the EvolvOS component of the Self-Evolving AI system.
+Enhanced Bayesian Optimizer with multi-objective optimization 
+for self-evolving system components.
 """
 
 import numpy as np
-import time
-import uuid
-import json
-from typing import Dict, List, Any, Optional, Tuple, Callable
-import random
+from typing import Dict, List, Tuple, Optional
 from scipy.stats import norm
+from scipy.optimize import minimize
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel
+import logging
+import time
 
-class GaussianProcess:
-    """
-    Simple Gaussian Process implementation for Bayesian optimization.
-    
-    This class implements a Gaussian Process regression model used as a
-    surrogate model in Bayesian optimization.
-    """
-    
-    def __init__(self, length_scale=1.0, noise=1e-6):
-        """
-        Initialize the Gaussian Process.
-        
-        Args:
-            length_scale: Length scale parameter for RBF kernel
-            noise: Noise level for observations
-        """
-        self.length_scale = length_scale
-        self.noise = noise
-        self.X_train = None
-        self.y_train = None
-        self.K = None  # Kernel matrix
-        self.K_inv = None  # Inverse of kernel matrix
-        
-    def fit(self, X: np.ndarray, y: np.ndarray):
-        """
-        Fit the Gaussian Process to training data.
-        
-        Args:
-            X: Training features (n_samples, n_features)
-            y: Training targets (n_samples,)
-        """
-        self.X_train = X.copy()
-        self.y_train = y.copy()
-        
-        # Compute kernel matrix
-        self.K = self._kernel(X, X) + self.noise * np.eye(len(X))
-        
-        # Compute inverse of kernel matrix
-        self.K_inv = np.linalg.inv(self.K)
-        
-    def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Make predictions with the Gaussian Process.
-        
-        Args:
-            X: Test features (n_samples, n_features)
-            
-        Returns:
-            Tuple of (mean, std) for predictions
-        """
-        if self.X_train is None or self.y_train is None:
-            raise ValueError("Model not fitted. Call fit() first.")
-            
-        # Compute kernel between test and training points
-        K_s = self._kernel(X, self.X_train)
-        
-        # Compute mean prediction
-        mean = K_s @ self.K_inv @ self.y_train
-        
-        # Compute covariance
-        K_ss = self._kernel(X, X)
-        var = K_ss - K_s @ self.K_inv @ K_s.T
-        
-        # Extract diagonal for standard deviation
-        std = np.sqrt(np.diag(var))
-        
-        return mean, std
-        
-    def _kernel(self, X1: np.ndarray, X2: np.ndarray) -> np.ndarray:
-        """
-        Compute RBF kernel matrix between two sets of points.
-        
-        Args:
-            X1: First set of points (n1_samples, n_features)
-            X2: Second set of points (n2_samples, n_features)
-            
-        Returns:
-            Kernel matrix (n1_samples, n2_samples)
-        """
-        # Compute squared Euclidean distance
-        X1_norm = np.sum(X1**2, axis=1).reshape(-1, 1)
-        X2_norm = np.sum(X2**2, axis=1).reshape(1, -1)
-        dist_sq = X1_norm + X2_norm - 2 * X1 @ X2.T
-        
-        # Compute RBF kernel
-        return np.exp(-0.5 * dist_sq / self.length_scale**2)
-
-class AcquisitionFunction:
-    """
-    Acquisition functions for Bayesian optimization.
-    
-    This class implements various acquisition functions used to guide
-    the exploration-exploitation trade-off in Bayesian optimization.
-    """
-    
-    @staticmethod
-    def expected_improvement(mean: np.ndarray, std: np.ndarray, y_best: float, xi: float = 0.01) -> np.ndarray:
-        """
-        Expected Improvement acquisition function.
-        
-        Args:
-            mean: Predicted mean (n_samples,)
-            std: Predicted standard deviation (n_samples,)
-            y_best: Best observed value
-            xi: Exploration-exploitation trade-off parameter
-            
-        Returns:
-            Expected improvement values (n_samples,)
-        """
-        # Ensure std is positive
-        std = np.maximum(std, 1e-9)
-        
-        # Compute improvement
-        imp = mean - y_best - xi
-        
-        # Compute Z-score
-        z = imp / std
-        
-        # Compute expected improvement
-        ei = imp * norm.cdf(z) + std * norm.pdf(z)
-        
-        # Return 0 for negative improvement
-        return np.maximum(ei, 0)
-        
-    @staticmethod
-    def upper_confidence_bound(mean: np.ndarray, std: np.ndarray, kappa: float = 2.0) -> np.ndarray:
-        """
-        Upper Confidence Bound acquisition function.
-        
-        Args:
-            mean: Predicted mean (n_samples,)
-            std: Predicted standard deviation (n_samples,)
-            kappa: Exploration parameter
-            
-        Returns:
-            UCB values (n_samples,)
-        """
-        return mean + kappa * std
-        
-    @staticmethod
-    def probability_of_improvement(mean: np.ndarray, std: np.ndarray, y_best: float, xi: float = 0.01) -> np.ndarray:
-        """
-        Probability of Improvement acquisition function.
-        
-        Args:
-            mean: Predicted mean (n_samples,)
-            std: Predicted standard deviation (n_samples,)
-            y_best: Best observed value
-            xi: Exploration-exploitation trade-off parameter
-            
-        Returns:
-            Probability of improvement values (n_samples,)
-        """
-        # Ensure std is positive
-        std = np.maximum(std, 1e-9)
-        
-        # Compute Z-score
-        z = (mean - y_best - xi) / std
-        
-        # Compute probability of improvement
-        return norm.cdf(z)
-
-class HyperparameterSpace:
-    """
-    Defines the search space for hyperparameters.
-    
-    This class represents the hyperparameter space for Bayesian optimization,
-    handling different types of parameters (continuous, integer, categorical).
-    """
-    
-    def __init__(self):
-        """Initialize an empty hyperparameter space."""
-        self.params = {}
-        self.param_types = {}
-        
-    def add_continuous_param(self, name: str, low: float, high: float):
-        """
-        Add a continuous hyperparameter.
-        
-        Args:
-            name: Parameter name
-            low: Lower bound
-            high: Upper bound
-        """
-        self.params[name] = (low, high)
-        self.param_types[name] = "continuous"
-        
-    def add_integer_param(self, name: str, low: int, high: int):
-        """
-        Add an integer hyperparameter.
-        
-        Args:
-            name: Parameter name
-            low: Lower bound (inclusive)
-            high: Upper bound (inclusive)
-        """
-        self.params[name] = (low, high)
-        self.param_types[name] = "integer"
-        
-    def add_categorical_param(self, name: str, categories: List):
-        """
-        Add a categorical hyperparameter.
-        
-        Args:
-            name: Parameter name
-            categories: List of possible values
-        """
-        self.params[name] = categories
-        self.param_types[name] = "categorical"
-        
-    def sample_random(self, n_samples: int = 1) -> List[Dict]:
-        """
-        Generate random samples from the hyperparameter space.
-        
-        Args:
-            n_samples: Number of samples to generate
-            
-        Returns:
-            List of parameter dictionaries
-        """
-        samples = []
-        
-        for _ in range(n_samples):
-            sample = {}
-            
-            for name, param_range in self.params.items():
-                param_type = self.param_types[name]
-                
-                if param_type == "continuous":
-                    low, high = param_range
-                    sample[name] = np.random.uniform(low, high)
-                elif param_type == "integer":
-                    low, high = param_range
-                    sample[name] = np.random.randint(low, high + 1)
-                elif param_type == "categorical":
-                    categories = param_range
-                    sample[name] = np.random.choice(categories)
-                    
-            samples.append(sample)
-            
-        return samples
-        
-    def to_array(self, params: Dict) -> np.ndarray:
-        """
-        Convert a parameter dictionary to a numpy array.
-        
-        Args:
-            params: Parameter dictionary
-            
-        Returns:
-            Numpy array representation
-        """
-        array = []
-        
-        for name in sorted(self.params.keys()):
-            param_type = self.param_types[name]
-            value = params[name]
-            
-            if param_type == "continuous":
-                low, high = self.params[name]
-                # Normalize to [0, 1]
-                normalized = (value - low) / (high - low)
-                array.append(normalized)
-            elif param_type == "integer":
-                low, high = self.params[name]
-                # Normalize to [0, 1]
-                normalized = (value - low) / (high - low)
-                array.append(normalized)
-            elif param_type == "categorical":
-                categories = self.params[name]
-                # One-hot encoding
-                for category in categories:
-                    array.append(1.0 if value == category else 0.0)
-                    
-        return np.array(array)
-        
-    def from_array(self, array: np.ndarray) -> Dict:
-        """
-        Convert a numpy array back to a parameter dictionary.
-        
-        Args:
-            array: Numpy array representation
-            
-        Returns:
-            Parameter dictionary
-        """
-        params = {}
-        idx = 0
-        
-        for name in sorted(self.params.keys()):
-            param_type = self.param_types[name]
-            
-            if param_type == "continuous":
-                low, high = self.params[name]
-                # Denormalize from [0, 1]
-                value = low + array[idx] * (high - low)
-                params[name] = value
-                idx += 1
-            elif param_type == "integer":
-                low, high = self.params[name]
-                # Denormalize from [0, 1] and round to integer
-                value = int(round(low + array[idx] * (high - low)))
-                # Ensure value is within bounds
-                value = max(low, min(high, value))
-                params[name] = value
-                idx += 1
-            elif param_type == "categorical":
-                categories = self.params[name]
-                # Find category with highest probability
-                category_probs = array[idx:idx+len(categories)]
-                category_idx = np.argmax(category_probs)
-                params[name] = categories[category_idx]
-                idx += len(categories)
-                
-        return params
-        
-    def get_dimensions(self) -> int:
-        """
-        Get the dimensionality of the hyperparameter space.
-        
-        Returns:
-            Number of dimensions in the array representation
-        """
-        dims = 0
-        
-        for name, param_type in self.param_types.items():
-            if param_type in ["continuous", "integer"]:
-                dims += 1
-            elif param_type == "categorical":
-                dims += len(self.params[name])
-                
-        return dims
+logger = logging.getLogger("EvolvOS.BayesianOpt")
 
 class BayesianOptimizer:
-    """
-    Bayesian optimization for hyperparameter tuning.
-    
-    This class implements Bayesian optimization for efficient hyperparameter tuning,
-    using Gaussian Processes as surrogate models and acquisition functions to guide
-    the search process.
-    """
-    
-    def __init__(self, param_space: HyperparameterSpace, 
-                objective_fn: Callable[[Dict], float],
-                acquisition_type: str = "ei",
-                maximize: bool = True,
-                exploration_weight: float = 0.1):
-        """
-        Initialize the Bayesian optimizer.
+    def __init__(self, parameter_ranges: Dict[str, Tuple[float, float]], 
+                 n_init_points: int = 5,
+                 acquisition_func: str = "ucb",
+                 beta: float = 2.0):
+        self.parameter_ranges = parameter_ranges
+        self.param_names = list(parameter_ranges.keys())
+        self.n_init_points = n_init_points
+        self.acquisition_func = acquisition_func
+        self.beta = beta
         
-        Args:
-            param_space: Hyperparameter search space
-            objective_fn: Function to optimize (takes params dict, returns float)
-            acquisition_type: Acquisition function type ('ei', 'ucb', or 'pi')
-            maximize: Whether to maximize (True) or minimize (False) the objective
-            exploration_weight: Weight for exploration vs exploitation
-        """
-        self.param_space = param_space
-        self.objective_fn = objective_fn
-        self.acquisition_type = acquisition_type
-        self.maximize = maximize
-        self.exploration_weight = exploration_weight
+        # Initialize storage for observations
+        self.X = []  # Parameter configurations
+        self.y = []  # Observed values
         
-        # Initialize Gaussian Process
-        self.gp = GaussianProcess()
+        # Initialize GP model with RBF kernel
+        self.gp = None
+        self._init_gp()
         
-        # Initialize history
-        self.X_observed = []  # List of parameter dicts
-        self.y_observed = []  # List of objective values
-        self.X_array = []     # Array representation of parameters
+        logger.info(f"Initialized Bayesian Optimizer with {len(parameter_ranges)} parameters")
         
-        # Set acquisition function
-        if acquisition_type == "ei":
-            self.acquisition_fn = AcquisitionFunction.expected_improvement
-        elif acquisition_type == "ucb":
-            self.acquisition_fn = AcquisitionFunction.upper_confidence_bound
-        elif acquisition_type == "pi":
-            self.acquisition_fn = AcquisitionFunction.probability_of_improvement
+    def _init_gp(self):
+        """Initialize Gaussian Process model."""
+        kernel = ConstantKernel(1.0) * RBF(length_scale=[1.0] * len(self.parameter_ranges))
+        self.gp = GaussianProcessRegressor(
+            kernel=kernel,
+            n_restarts_optimizer=5,
+            random_state=42
+        )
+        
+    def _normalize_params(self, params: Dict[str, float]) -> np.ndarray:
+        """Normalize parameters to [0, 1] range."""
+        normalized = []
+        for name in self.param_names:
+            min_val, max_val = self.parameter_ranges[name]
+            val = params[name]
+            normalized.append((val - min_val) / (max_val - min_val))
+        return np.array(normalized)
+        
+    def _denormalize_params(self, normalized: np.ndarray) -> Dict[str, float]:
+        """Convert normalized parameters back to original range."""
+        params = {}
+        for i, name in enumerate(self.param_names):
+            min_val, max_val = self.parameter_ranges[name]
+            params[name] = normalized[i] * (max_val - min_val) + min_val
+        return params
+        
+    def _acquisition_function(self, x: np.ndarray) -> float:
+        """Compute acquisition function value."""
+        x = x.reshape(1, -1)
+        
+        if len(self.X) == 0:
+            return 0.0
+            
+        mean, std = self.gp.predict(x, return_std=True)
+        
+        if self.acquisition_func == "ucb":
+            # Upper Confidence Bound
+            return mean[0] + self.beta * std[0]
+        elif self.acquisition_func == "ei":
+            # Expected Improvement
+            y_best = np.max(self.y)
+            z = (mean - y_best) / std
+            return float((mean - y_best) * norm.cdf(z) + std * norm.pdf(z))
+        elif self.acquisition_func == "poi":
+            # Probability of Improvement
+            y_best = np.max(self.y)
+            z = (mean - y_best) / std
+            return float(norm.cdf(z))
         else:
-            raise ValueError(f"Unknown acquisition function: {acquisition_type}")
+            raise ValueError(f"Unknown acquisition function: {self.acquisition_func}")
             
-        # For tracking optimization
-        self.id = str(uuid.uuid4())
-        self.start_time = time.time()
-        self.best_value = None
-        self.best_params = None
+    def _optimize_acquisition(self) -> np.ndarray:
+        """Find the maximum of the acquisition function."""
+        best_x = None
+        best_acq = -np.inf
         
-    def suggest(self, n_samples: int = 10000) -> Dict:
-        """
-        Suggest next set of parameters to evaluate.
-        
-        Args:
-            n_samples: Number of random samples to evaluate with acquisition function
+        # Try multiple random starts
+        n_random = 10 * len(self.parameter_ranges)
+        for _ in range(n_random):
+            x0 = np.random.rand(len(self.parameter_ranges))
             
-        Returns:
-            Dictionary of suggested parameters
-        """
-        # If no observations yet, return random parameters
-        if not self.X_observed:
-            return self.param_space.sample_random(1)[0]
-            
-        # Fit GP to observed data
-        X_array = np.array(self.X_array)
-        y_array = np.array(self.y_observed)
-        
-        # If maximizing, negate the objective for the GP
-        if self.maximize:
-            y_array = -y_array
-            
-        self.gp.fit(X_array, y_array)
-        
-        # Generate random candidate points
-        candidates = self.param_space.sample_random(n_samples)
-        candidates_array = np.array([self.param_space.to_array(c) for c in candidates])
-        
-        # Predict with GP
-        mean, std = self.gp.predict(candidates_array)
-        
-        # Find best observed value
-        if self.maximize:
-            y_best = -min(y_array)  # Convert back to original
-        else:
-            y_best = min(y_array)
-            
-        # Compute acquisition function values
-        if self.acquisition_type == "ucb":
-            acq_values = self.acquisition_fn(
-                mean if not self.maximize else -mean,
-                std,
-                kappa=self.exploration_weight
-            )
-        else:  # ei or pi
-            acq_values = self.acquisition_fn(
-                mean if not self.maximize else -mean,
-                std,
-                y_best,
-                xi=self.exploration_weight
+            # Optimize from this starting point
+            res = minimize(
+                lambda x: -self._acquisition_function(x),
+                x0,
+                bounds=[(0, 1)] * len(self.parameter_ranges),
+                method="L-BFGS-B"
             )
             
-        # Find candidate with highest acquisition value
-        best_idx = np.argmax(acq_values)
-        best_candidate = candidates[best_idx]
+            if -res.fun > best_acq:
+                best_acq = -res.fun
+                best_x = res.x
+                
+        return best_x
         
-        return best_candidate
-        
-    def observe(self, params: Dict, value: float):
-        """
-        Record an observation of the objective function.
-        
-        Args:
-            params: Parameter dictionary
-            value: Observed objective value
-        """
-        # Convert parameters to array
-        params_array = self.param_space.to_array(params)
-        
-        # Add to history
-        self.X_observed.append(params.copy())
-        self.y_observed.append(value)
-        self.X_array.append(params_array)
-        
-        # Update best value
-        if self.best_value is None or (self.maximize and value > self.best_value) or (not self.maximize and value < self.best_value):
-            self.best_value = value
-            self.best_params = params.copy()
+    def suggest_params(self) -> Dict[str, float]:
+        """Suggest next set of parameters to try."""
+        if len(self.X) < self.n_init_points:
+            # Initial random exploration
+            normalized_params = np.random.rand(len(self.parameter_ranges))
+        else:
+            # Use Bayesian optimization
+            normalized_params = self._optimize_acquisition()
             
-    def optimize(self, n_iterations: int = 10, initial_points: int = 5) -> Tuple[Dict, float]:
-        """
-        Run the optimization process.
+        return self._denormalize_params(normalized_params)
         
-        Args:
-            n_iterations: Number of optimization iterations
-            initial_points: Number of random points to evaluate initially
-            
-        Returns:
-            Tuple of (best_params, best_value)
-        """
-        print(f"Starting Bayesian optimization with {n_iterations} iterations")
+    def update(self, params: Dict[str, float], value: float):
+        """Update the model with new observation."""
+        normalized_params = self._normalize_params(params)
         
-        # Initial random exploration
-        initial_params = self.param_space.sample_random(initial_points)
+        # Add to observation history
+        if len(self.X) == 0:
+            self.X = normalized_params.reshape(1, -1)
+            self.y = np.array([value]).reshape(-1, 1)
+        else:
+            self.X = np.vstack([self.X, normalized_params])
+            self.y = np.vstack([self.y, value])
+            
+        # Update GP model
+        self.gp.fit(self.X, self.y)
         
-        for i, params in enumerate(initial_params):
-            print(f"Evaluating initial point {i+1}/{initial_points}")
-            value = self.objective_fn(params)
-            self.observe(params, value)
-            
-            print(f"  Parameters: {params}")
-            print(f"  Value: {value}")
-            
-        # Main optimization loop
-        for i in range(n_iterations):
-            print(f"Iteration {i+1}/{n_iterations}")
-            
-            # Get suggestion
-            suggested_params = self.suggest()
-            
-            # Evaluate objective
-            value = self.objective_fn(suggested_params)
-            
-            # Record observation
-            self.observe(suggested_params, value)
-            
-            print(f"  Parameters: {suggested_params}")
-            print(f"  Value: {value}")
-            print(f"  Best value so far: {self.best_value}")
-            
-        print(f"Optimization completed. Best value: {self.best_value}")
-        print(f"Best parameters: {self.best_params}")
+        logger.debug(f"Updated model with new observation. Total observations: {len(self.X)}")
         
-        return self.best_params, self.best_value
+    def get_best_params(self) -> Tuple[Dict[str, float], float]:
+        """Get the best parameters found so far."""
+        if len(self.X) == 0:
+            return None, None
+            
+        best_idx = np.argmax(self.y)
+        best_normalized = self.X[best_idx]
+        best_value = self.y[best_idx][0]
         
-    def get_results(self) -> Dict:
-        """
-        Get optimization results.
+        return self._denormalize_params(best_normalized), best_value
         
-        Returns:
-            Dictionary with optimization results
-        """
+    def get_state(self) -> Dict:
+        """Get optimizer state for saving."""
         return {
-            "optimizer_id": self.id,
-            "best_value": self.best_value,
-            "best_params": self.best_params,
-            "n_observations": len(self.y_observed),
-            "observation_history": [
-                {"params": params, "value": value}
-                for params, value in zip(self.X_observed, self.y_observed)
-            ],
-            "run_time_seconds": time.time() - self.start_time
+            "X": self.X,
+            "y": self.y,
+            "parameter_ranges": self.parameter_ranges,
+            "acquisition_func": self.acquisition_func,
+            "beta": self.beta,
+            "gp_params": {
+                "kernel": self.gp.kernel_.get_params(),
+                "noise": self.gp.alpha
+            }
         }
+        
+    def load_state(self, state: Dict):
+        """Load optimizer state."""
+        self.X = state["X"]
+        self.y = state["y"]
+        self.parameter_ranges = state["parameter_ranges"]
+        self.acquisition_func = state["acquisition_func"]
+        self.beta = state["beta"]
+        
+        if len(self.X) > 0:
+            self._init_gp()
+            self.gp.fit(self.X, self.y)
+            self.gp.kernel_.set_params(**state["gp_params"]["kernel"])
+            self.gp.alpha = state["gp_params"]["noise"]
 
-class EvolvOSOptimizer:
-    """
-    Specialized Bayesian optimizer for EvolvOS components.
+class MultiObjectiveBayesianOptimizer(BayesianOptimizer):
+    """Enhanced optimizer with multi-objective optimization support."""
     
-    This class provides a convenient interface for optimizing specific
-    components of the EvolvOS system using Bayesian optimization.
-    """
-    
-    def __init__(self, component_name: str, eval_function: Callable):
-        """
-        Initialize the EvolvOS optimizer.
-        
-        Args:
-            component_name: Name of the component to optimize
-            eval_function: Function to evaluate component performance
-        """
-        self.component_name = component_name
-        self.eval_function = eval_function
-        self.param_space = HyperparameterSpace()
-        self.configured = False
-        
-        # Set default parameters based on component
-        self._configure_default_params()
-        
-    def _configure_default_params(self):
-        """Configure default parameters based on component type."""
-        if self.component_name == "memory":
-            # Memory system parameters
-            self.param_space.add_integer_param("volatile_size", 100, 2000)
-            self.param_space.add_integer_param("compression_threshold", 10, 100)
-            self.param_space.add_continuous_param("retention_factor", 0.1, 0.9)
-            self.param_space.add_integer_param("max_batch_size", 5, 50)
-            
-        elif self.component_name == "dream_system":
-            # Dream system parameters
-            self.param_space.add_integer_param("agent_count", 3, 10)
-            self.param_space.add_integer_param("max_debate_rounds", 2, 8)
-            self.param_space.add_continuous_param("consensus_threshold", 0.5, 0.95)
-            self.param_space.add_continuous_param("agent_temperature", 0.1, 1.0)
-            
-        elif self.component_name == "evolvos":
-            # EvolvOS parameters
-            self.param_space.add_integer_param("evolution_cycles", 1, 10)
-            self.param_space.add_integer_param("population_size", 5, 50)
-            self.param_space.add_continuous_param("mutation_rate", 0.1, 0.8)
-            self.param_space.add_continuous_param("crossover_rate", 0.1, 0.8)
-            
-        elif self.component_name == "neural_architecture":
-            # Neural architecture parameters
-            self.param_space.add_integer_param("hidden_layers", 1, 5)
-            self.param_space.add_integer_param("neurons_per_layer", 32, 512)
-            self.param_space.add_categorical_param("activation", ["relu", "tanh", "sigmoid"])
-            self.param_space.add_continuous_param("dropout_rate", 0.0, 0.5)
-            self.param_space.add_continuous_param("learning_rate", 0.0001, 0.1)
-            
-        else:
-            # Generic parameters
-            self.param_space.add_continuous_param("param1", 0.0, 1.0)
-            self.param_space.add_continuous_param("param2", 0.0, 1.0)
-            self.param_space.add_integer_param("param3", 1, 10)
-            
-        self.configured = True
-        
-    def add_custom_param(self, name: str, param_type: str, *args):
-        """
-        Add a custom parameter to the optimization space.
-        
-        Args:
-            name: Parameter name
-            param_type: Parameter type ('continuous', 'integer', or 'categorical')
-            *args: Arguments depending on param_type
-        """
-        if param_type == "continuous":
-            low, high = args
-            self.param_space.add_continuous_param(name, low, high)
-        elif param_type == "integer":
-            low, high = args
-            self.param_space.add_integer_param(name, low, high)
-        elif param_type == "categorical":
-            categories = args[0]
-            self.param_space.add_categorical_param(name, categories)
-        else:
-            raise ValueError(f"Unknown parameter type: {param_type}")
-            
-    def optimize(self, n_iterations: int = 20, maximize: bool = True) -> Dict:
-        """
-        Run the optimization process.
-        
-        Args:
-            n_iterations: Number of optimization iterations
-            maximize: Whether to maximize or minimize the objective
-            
-        Returns:
-            Optimization results
-        """
-        if not self.configured:
-            raise ValueError("Optimizer not properly configured")
-            
-        # Create Bayesian optimizer
-        optimizer = BayesianOptimizer(
-            param_space=self.param_space,
-            objective_fn=self.eval_function,
-            acquisition_type="ei",
-            maximize=maximize,
-            exploration_weight=0.1
-        )
-        
-        # Run optimization
-        best_params, best_value = optimizer.optimize(
-            n_iterations=n_iterations,
-            initial_points=max(3, n_iterations // 5)
-        )
-        
-        # Get full results
-        results = optimizer.get_results()
-        results["component_name"] = self.component_name
-        
-        return results
+    def __init__(self, parameter_ranges: Dict[str, Tuple[float, float]],
+                 n_objectives: int = 2,
+                 weights: Optional[List[float]] = None,
+                 n_init_points: int = 5,
+                 acquisition_func: str = "ucb",
+                 beta: float = 2.0):
+        # Validate inputs
+        if n_objectives < 1:
+            raise ValueError("Number of objectives must be positive")
+        if weights and len(weights) != n_objectives:
+            raise ValueError("Number of weights must match number of objectives")
+        if weights and not all(0 <= w <= 1 for w in weights):
+            raise ValueError("Weights must be between 0 and 1")
+        if weights and abs(sum(weights) - 1.0) > 1e-6:
+            raise ValueError("Weights must sum to 1")
 
-# Example usage
-def example_usage():
-    """Demonstrate usage of the Bayesian optimizer."""
-    # Define a test objective function
-    def objective_fn(params):
-        """Simple test function with noise."""
-        x = params["x"]
-        y = params["y"]
-        # Sphere function with some noise
-        value = -(x**2 + y**2) + 0.1 * np.random.randn()
-        return value
+        super().__init__(parameter_ranges, n_init_points, acquisition_func, beta)
+        self.n_objectives = n_objectives
+        self.weights = weights if weights is not None else [1.0/n_objectives] * n_objectives
         
-    # Create parameter space
-    param_space = HyperparameterSpace()
-    param_space.add_continuous_param("x", -5.0, 5.0)
-    param_space.add_continuous_param("y", -5.0, 5.0)
-    
-    # Create optimizer
-    optimizer = BayesianOptimizer(
-        param_space=param_space,
-        objective_fn=objective_fn,
-        acquisition_type="ei",
-        maximize=True
-    )
-    
-    # Run optimization
-    best_params, best_value = optimizer.optimize(n_iterations=10, initial_points=3)
-    
-    print("\nOptimization results:")
-    print(f"Best parameters: {best_params}")
-    print(f"Best value: {best_value}")
-    
-    # Example with EvolvOS optimizer
-    def neural_arch_eval(params):
-        """Dummy evaluator for neural architecture."""
-        # Higher values for balanced architectures
-        layers = params["hidden_layers"]
-        neurons = params["neurons_per_layer"]
-        dropout = params["dropout_rate"]
+        # Add error recovery state
+        self.failed_evaluations = []
+        self.recovery_threshold = 3
+        self.last_successful_state = None
         
-        # Prefer moderate layer count and neuron count
-        layer_score = -0.2 * abs(layers - 3)
-        neuron_score = -0.0001 * abs(neurons - 128)
-        
-        # Prefer moderate dropout
-        dropout_score = -2.0 * abs(dropout - 0.3)
-        
-        # Add noise
-        score = layer_score + neuron_score + dropout_score + 0.1 * np.random.randn()
-        return score
-        
-    evolvos_opt = EvolvOSOptimizer("neural_architecture", neural_arch_eval)
-    results = evolvos_opt.optimize(n_iterations=5)
-    
-    print("\nEvolvOS Optimizer results:")
-    print(f"Best parameters: {results['best_params']}")
-    print(f"Best value: {results['best_value']}")
-    
-    return optimizer, evolvos_opt
+        # Initialize GP models
+        self.gp_models = None
+        self._init_multi_gp()
 
-if __name__ == "__main__":
-    example_usage() 
+    def _validate_objectives(self, values: List[float]) -> bool:
+        """Validate objective values."""
+        if len(values) != self.n_objectives:
+            return False
+        return all(isinstance(v, (int, float)) for v in values)
+
+    def _handle_evaluation_error(self, params: Dict[str, float], error: Exception) -> None:
+        """Handle failed parameter evaluation."""
+        self.failed_evaluations.append({
+            "params": params,
+            "error": str(error),
+            "timestamp": time.time()
+        })
+        
+        # Check if we need to revert to last good state
+        recent_failures = [f for f in self.failed_evaluations 
+                         if time.time() - f["timestamp"] < 3600]  # Last hour
+        if len(recent_failures) >= self.recovery_threshold:
+            if self.last_successful_state:
+                logger.warning("Multiple evaluation failures detected, reverting to last good state")
+                self.load_state(self.last_successful_state)
+            else:
+                logger.warning("Multiple evaluation failures but no recovery state available")
+
+    def _init_multi_gp(self):
+        """Initialize multiple GP models for each objective."""
+        self.gp_models = []
+        for i in range(self.n_objectives):
+            kernel = ConstantKernel(1.0) * RBF(length_scale=[1.0] * len(self.parameter_ranges))
+            self.gp_models.append(
+                GaussianProcessRegressor(
+                    kernel=kernel,
+                    n_restarts_optimizer=5,
+                    random_state=42+i
+                )
+            )
+            
+    def _acquisition_function_multi(self, x: np.ndarray) -> float:
+        """Compute weighted acquisition function for multiple objectives."""
+        x = x.reshape(1, -1)
+        acquisition_values = []
+        
+        for i, gp in enumerate(self.gp_models):
+            if len(self.y_multi[i]) == 0:
+                acquisition_values.append(0.0)
+                continue
+                
+            mean, std = gp.predict(x, return_std=True)
+            
+            if self.acquisition_func == "ucb":
+                acq = mean[0] + self.beta * std[0]
+            elif self.acquisition_func == "ei":
+                y_best = np.max(self.y_multi[i])
+                z = (mean[0] - y_best) / std[0]
+                acq = float((mean[0] - y_best) * norm.cdf(z) + std[0] * norm.pdf(z))
+            else:  # poi
+                y_best = np.max(self.y_multi[i])
+                z = (mean[0] - y_best) / std[0]
+                acq = float(norm.cdf(z))
+                
+            acquisition_values.append(acq)
+            
+        # Weighted sum of acquisition values
+        return np.sum([w * v for w, v in zip(self.weights, acquisition_values)])
+        
+    def _update_pareto_front(self):
+        """Update the Pareto front of non-dominated solutions."""
+        if len(self.X) == 0:
+            return
+            
+        # Convert objectives to array for easier manipulation
+        Y = np.array([self.y_multi[i] for i in range(self.n_objectives)]).T
+        
+        # Identify non-dominated solutions
+        is_pareto = np.ones(len(self.X), dtype=bool)
+        for i in range(len(self.X)):
+            for j in range(len(self.X)):
+                if i != j:
+                    if np.all(Y[j] >= Y[i]) and np.any(Y[j] > Y[i]):
+                        is_pareto[i] = False
+                        break
+                        
+        # Update Pareto front
+        self.pareto_front = []
+        for i in range(len(self.X)):
+            if is_pareto[i]:
+                self.pareto_front.append({
+                    'params': self._denormalize_params(self.X[i]),
+                    'objectives': [float(self.y_multi[obj][i]) for obj in range(self.n_objectives)]
+                })
+                
+    def update_multi(self, params: Dict[str, float], values: List[float]):
+        """Update models with multi-objective observations with error handling."""
+        try:
+            if not self._validate_objectives(values):
+                raise ValueError(f"Invalid objective values: {values}")
+                
+            normalized_params = self._normalize_params(params)
+            
+            # Update observation history
+            if len(self.X) == 0:
+                self.X = normalized_params.reshape(1, -1)
+                for i in range(self.n_objectives):
+                    self.y_multi[i] = [values[i]]
+            else:
+                self.X = np.vstack([self.X, normalized_params])
+                for i in range(self.n_objectives):
+                    self.y_multi[i].append(values[i])
+                    
+            # Update GP models with error checking
+            update_success = True
+            for i, gp in enumerate(self.gp_models):
+                try:
+                    y = np.array(self.y_multi[i]).reshape(-1, 1)
+                    gp.fit(self.X, y)
+                except Exception as e:
+                    logger.error(f"Error updating GP model {i}: {str(e)}")
+                    update_success = False
+                    
+            if update_success:
+                # Save successful state
+                self.last_successful_state = self.get_state()
+                
+                # Update Pareto front
+                self._update_pareto_front()
+                
+                # Update primary GP with weighted combination
+                weighted_y = np.sum([w * np.array(y) for w, y in zip(self.weights, self.y_multi)], axis=0)
+                self.y = weighted_y.reshape(-1, 1)
+                self.gp.fit(self.X, self.y)
+            
+        except Exception as e:
+            self._handle_evaluation_error(params, e)
+            raise
+
+    def suggest_params_multi(self) -> Dict[str, float]:
+        """Suggest next parameters using multi-objective optimization with validation."""
+        try:
+            suggestion = super().suggest_params()
+            
+            # Validate suggestion
+            for param, value in suggestion.items():
+                param_range = self.parameter_ranges[param]
+                if not param_range[0] <= value <= param_range[1]:
+                    logger.warning(f"Invalid parameter value generated for {param}")
+                    # Fix the value to be within bounds
+                    suggestion[param] = max(param_range[0], min(value, param_range[1]))
+                    
+            return suggestion
+            
+        except Exception as e:
+            logger.error(f"Error suggesting parameters: {str(e)}")
+            # Fall back to random sampling
+            return self._sample_params()
+
+    def get_pareto_front(self) -> List[Dict]:
+        """Get current Pareto front solutions."""
+        return self.pareto_front
+        
+    def get_state(self) -> Dict:
+        """Get optimizer state including multi-objective data."""
+        state = super().get_state()
+        state.update({
+            "n_objectives": self.n_objectives,
+            "weights": self.weights,
+            "y_multi": self.y_multi,
+            "pareto_front": self.pareto_front,
+            "gp_models_params": [{
+                "kernel": gp.kernel_.get_params(),
+                "noise": gp.alpha
+            } for gp in self.gp_models]
+        })
+        return state
+        
+    def load_state(self, state: Dict):
+        """Load optimizer state including multi-objective data."""
+        super().load_state(state)
+        self.n_objectives = state["n_objectives"]
+        self.weights = state["weights"]
+        self.y_multi = state["y_multi"]
+        self.pareto_front = state["pareto_front"]
+        
+        if len(self.X) > 0:
+            self._init_multi_gp()
+            for i, gp in enumerate(self.gp_models):
+                y = np.array(self.y_multi[i]).reshape(-1, 1)
+                gp.fit(self.X, y)
+                gp.kernel_.set_params(**state["gp_models_params"][i]["kernel"])
+                gp.alpha = state["gp_models_params"][i]["noise"]

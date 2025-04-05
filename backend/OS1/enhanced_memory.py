@@ -12,6 +12,11 @@ from collections import OrderedDict
 import sys
 import os
 import importlib.util
+import torch
+import glob
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Load the self_evolving_prototype module from the file
 spec = importlib.util.spec_from_file_location("self_evolving_prototype", 
@@ -236,6 +241,56 @@ class EnhancedHierarchicalMemory(HierarchicalMemory):
         if archival_enabled:
             self.archival_memory = ArchivalMemory()
         
+        self.cleanup_scheduled = False
+        self.last_cleanup = time.time()
+        self.memory_monitor = MemoryMonitor()
+    
+    def cleanup(self):
+        """Perform thorough cleanup of memory resources."""
+        try:
+            # Clear memory maps
+            for memory_id in list(self.documents.keys()):
+                self._cleanup_memory_maps(memory_id)
+                
+            # Clear GPU cache if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            # Clear internal caches
+            self.cache.clear()
+            self._clear_temp_storage()
+            
+            # Reset monitoring
+            self.cleanup_scheduled = False
+            self.last_cleanup = time.time()
+            
+            logger.info("Successfully cleaned up memory resources")
+            
+        except Exception as e:
+            logger.error(f"Error during memory cleanup: {str(e)}")
+            
+    def _cleanup_memory_maps(self, memory_id: str):
+        """Clean up memory maps for a specific memory ID."""
+        try:
+            mmap_path = f"mmap_{memory_id}.bin"
+            if os.path.exists(mmap_path):
+                os.remove(mmap_path)
+        except Exception as e:
+            logger.error(f"Error cleaning up memory maps for {memory_id}: {str(e)}")
+            
+    def _clear_temp_storage(self):
+        """Clear temporary storage files."""
+        try:
+            temp_pattern = "temp_*.bin"
+            for temp_file in glob.glob(temp_pattern):
+                os.remove(temp_file)
+        except Exception as e:
+            logger.error(f"Error clearing temporary storage: {str(e)}")
+            
+    def __del__(self):
+        """Ensure cleanup on deletion."""
+        self.cleanup()
+    
     def store(self, content: Any, metadata: Optional[Dict] = None) -> str:
         """
         Store content in memory and return memory ID.
@@ -567,4 +622,4 @@ def example_usage():
         print(f"{i+1}. {result['content']}")
 
 if __name__ == "__main__":
-    example_usage() 
+    example_usage()

@@ -1,253 +1,192 @@
 """
-Vector Symbolic Architecture (VSA) for Agent Communication
+Enhanced Vector Symbolic Architecture (VSA) with GPU Acceleration
 
-This module implements Vector Symbolic Architecture for the Dream System multi-agent framework,
-enabling more sophisticated agent communication and reasoning using high-dimensional vectors.
+This module implements an enhanced Vector Symbolic Architecture for the Dream System,
+with GPU acceleration, improved memory efficiency, and advanced symbolic operations.
 """
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-import random
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Union, Set
 import uuid
 import hashlib
+import logging
+from collections import defaultdict
 
-class VSAEncoder:
+logger = logging.getLogger("Dream.VSA")
+
+class HDVector:
     """
-    Vector Symbolic Architecture encoder for agent communication.
-    
-    Implements hyperdimensional computing techniques for symbolic manipulation
-    and reasoning with distributed representations.
+    Hyperdimensional Vector with GPU support and multiple vector types.
     """
     
-    def __init__(self, dimension: int = 10000, seed: int = None):
-        """
-        Initialize the VSA encoder.
-        
-        Args:
-            dimension: Dimensionality of the hypervectors
-            seed: Random seed for reproducibility
-        """
-        self.dimension = dimension
-        self.random_state = np.random.RandomState(seed)
-        
-        # Initialize symbol table for basic primitives
-        self.symbols = {}
-        
-        # Initialize role vectors for binding operations
-        self.roles = {}
-        
-        print(f"Initialized VSA encoder with {dimension}-dimensional vectors")
-        
-    def get_symbol(self, symbol_name: str) -> np.ndarray:
-        """
-        Get or create a symbol vector.
-        
-        Args:
-            symbol_name: Name of the symbol
+    def __init__(self, 
+                 data: Union[torch.Tensor, np.ndarray], 
+                 vtype: str = "bipolar",
+                 device: Optional[torch.device] = None):
+        """Initialize hyperdimensional vector."""
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
             
-        Returns:
-            Hypervector representing the symbol
-        """
+        if isinstance(data, np.ndarray):
+            self.data = torch.from_numpy(data).to(self.device)
+        else:
+            self.data = data.to(self.device)
+            
+        self.vtype = vtype
+        self.dimension = self.data.shape[0]
+    
+    @classmethod
+    def random(cls, 
+              dimension: int, 
+              vtype: str = "bipolar", 
+              device: Optional[torch.device] = None) -> 'HDVector':
+        """Create random hyperdimensional vector."""
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        if vtype == "binary":
+            data = torch.randint(0, 2, (dimension,), device=device).float()
+        elif vtype == "bipolar":
+            data = torch.randint(0, 2, (dimension,), device=device).float() * 2 - 1
+        elif vtype == "complex":
+            angles = torch.rand(dimension, device=device) * 2 * np.pi
+            real = torch.cos(angles)
+            imag = torch.sin(angles)
+            data = torch.complex(real, imag)
+        else:  # holographic
+            data = F.normalize(torch.randn(dimension, device=device), p=2, dim=0)
+            
+        return cls(data, vtype, device)
+
+class EnhancedVSAEncoder:
+    """Enhanced VSA encoder with GPU acceleration and advanced features."""
+    
+    def __init__(self, 
+                 dimension: int = 10000, 
+                 vtype: str = "bipolar",
+                 device: Optional[torch.device] = None):
+        """Initialize the enhanced VSA encoder."""
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
+            
+        self.dimension = dimension
+        self.vtype = vtype
+        
+        # Initialize with GPU support
+        self.symbols = {}
+        self.roles = {}
+        self.concept_spaces = defaultdict(dict)
+        self.compositions = {}
+        
+        logger.info(f"Initialized Enhanced VSA encoder with {dimension}-dimensional {vtype} vectors on {self.device}")
+
+    def get_symbol(self, symbol_name: str) -> HDVector:
+        """Get or create a symbol vector."""
         if symbol_name in self.symbols:
             return self.symbols[symbol_name]
             
-        # Create a new random hypervector
-        # Using bipolar vectors {-1, 1} for better binding properties
-        vector = self.random_state.choice([-1, 1], size=self.dimension)
-        
-        # Store for future use
+        vector = HDVector.random(self.dimension, self.vtype, self.device)
         self.symbols[symbol_name] = vector
-        
         return vector
         
-    def get_role(self, role_name: str) -> np.ndarray:
-        """
-        Get or create a role vector for binding.
-        
-        Args:
-            role_name: Name of the role
-            
-        Returns:
-            Hypervector representing the role
-        """
+    def get_role(self, role_name: str) -> HDVector:
+        """Get or create a role vector."""
         if role_name in self.roles:
             return self.roles[role_name]
             
-        # Create a new random hypervector
-        vector = self.random_state.choice([-1, 1], size=self.dimension)
-        
-        # Store for future use
+        vector = HDVector.random(self.dimension, self.vtype, self.device)
         self.roles[role_name] = vector
-        
         return vector
         
-    def bind(self, vector1: np.ndarray, vector2: np.ndarray) -> np.ndarray:
-        """
-        Bind two vectors using element-wise multiplication.
+    def bind(self, vector1: HDVector, vector2: HDVector) -> HDVector:
+        """Bind two vectors."""
+        return HDVector(vector1.data * vector2.data, self.vtype, self.device)
         
-        Args:
-            vector1: First vector
-            vector2: Second vector
-            
-        Returns:
-            Bound vector
-        """
-        return vector1 * vector2
+    def unbind(self, bound_vector: HDVector, key_vector: HDVector) -> HDVector:
+        """Unbind a vector."""
+        return HDVector(bound_vector.data * key_vector.data, self.vtype, self.device)
         
-    def unbind(self, bound_vector: np.ndarray, key_vector: np.ndarray) -> np.ndarray:
-        """
-        Unbind a vector using the key vector.
-        
-        Args:
-            bound_vector: Bound vector
-            key_vector: Key vector used for binding
-            
-        Returns:
-            Unbound vector
-        """
-        # For bipolar vectors, unbinding is the same as binding
-        return bound_vector * key_vector
-        
-    def bundle(self, vectors: List[np.ndarray]) -> np.ndarray:
-        """
-        Bundle vectors using element-wise addition.
-        
-        Args:
-            vectors: List of vectors to bundle
-            
-        Returns:
-            Bundled vector
-        """
+    def bundle(self, vectors: List[HDVector]) -> HDVector:
+        """Bundle vectors."""
         if not vectors:
-            return np.zeros(self.dimension)
+            return HDVector(torch.zeros(self.dimension, device=self.device), self.vtype, self.device)
             
-        # Simple element-wise addition
-        result = np.zeros(self.dimension)
+        result = torch.zeros(self.dimension, device=self.device)
         for vector in vectors:
-            result += vector
+            result += vector.data
             
-        return result
+        return HDVector(result, self.vtype, self.device)
         
-    def normalize(self, vector: np.ndarray) -> np.ndarray:
-        """
-        Normalize a vector to have only {-1, 1} elements.
+    def normalize(self, vector: HDVector) -> HDVector:
+        """Normalize a vector."""
+        return HDVector(torch.sign(vector.data), self.vtype, self.device)
         
-        Args:
-            vector: Vector to normalize
-            
-        Returns:
-            Normalized vector
-        """
-        # Convert to bipolar representation
-        return np.sign(vector)
-        
-    def cleanup(self, vector: np.ndarray, candidates: List[np.ndarray]) -> np.ndarray:
-        """
-        Find the closest vector in the candidates list.
-        
-        Args:
-            vector: Query vector
-            candidates: List of candidate vectors
-            
-        Returns:
-            The closest matching vector
-        """
+    def cleanup(self, vector: HDVector, candidates: List[HDVector]) -> HDVector:
+        """Find the closest vector in the candidates list."""
         if not candidates:
             return vector
             
-        # Calculate cosine similarity with each candidate
         similarities = [self.similarity(vector, candidate) for candidate in candidates]
-        
-        # Return the most similar candidate
-        best_index = np.argmax(similarities)
+        best_index = torch.argmax(torch.tensor(similarities))
         return candidates[best_index]
         
-    def similarity(self, vector1: np.ndarray, vector2: np.ndarray) -> float:
-        """
-        Calculate cosine similarity between two vectors.
-        
-        Args:
-            vector1: First vector
-            vector2: Second vector
-            
-        Returns:
-            Cosine similarity (-1 to 1)
-        """
-        return np.dot(vector1, vector2) / (np.linalg.norm(vector1) * np.linalg.norm(vector2))
+    def similarity(self, vector1: HDVector, vector2: HDVector) -> float:
+        """Calculate cosine similarity."""
+        return torch.dot(vector1.data, vector2.data).item() / (
+            torch.norm(vector1.data).item() * torch.norm(vector2.data).item()
+        )
 
 class VSAMessage:
-    """Represents a message encoded using Vector Symbolic Architecture."""
+    """Enhanced message using Vector Symbolic Architecture with GPU support."""
     
-    def __init__(self, encoder: VSAEncoder):
+    def __init__(self, encoder: EnhancedVSAEncoder):
+        """Initialize VSA message."""
         self.id = str(uuid.uuid4())
         self.encoder = encoder
         self.vector = None
         self.content = {}
+        self.timestamp = None
+        self.sender = None
+        self.recipients = []
         
     def add_role_filler(self, role: str, filler: str) -> None:
-        """
-        Add a role-filler binding to the message.
-        
-        Args:
-            role: Role name (e.g., "sender", "content", "action")
-            filler: Filler value
-        """
-        # Get vectors
+        """Add a role-filler binding to the message."""
         role_vector = self.encoder.get_role(role)
         filler_vector = self.encoder.get_symbol(filler)
-        
-        # Bind them
         binding = self.encoder.bind(role_vector, filler_vector)
         
-        # Store the content
         self.content[role] = filler
         
-        # Add to the message vector
         if self.vector is None:
             self.vector = binding
         else:
-            self.vector += binding
+            self.vector = self.encoder.bundle([self.vector, binding])
             
     def get_filler(self, role: str) -> Optional[str]:
-        """
-        Get the filler for a specific role.
-        
-        Args:
-            role: Role name
-            
-        Returns:
-            Filler value if found, None otherwise
-        """
+        """Get the filler for a specific role."""
         return self.content.get(role)
     
     def decode(self, role: str) -> str:
-        """
-        Decode the filler for a specific role from the vector.
-        
-        Args:
-            role: Role name
-            
-        Returns:
-            Most likely filler for the role
-        """
+        """Decode the filler for a specific role."""
         if self.vector is None:
             return None
             
-        # Get role vector
         role_vector = self.encoder.get_role(role)
-        
-        # Unbind
         unbound = self.encoder.unbind(self.vector, role_vector)
         
-        # Find closest match
         candidates = [(name, self.encoder.get_symbol(name)) 
                      for name in self.encoder.symbols]
         
-        # Calculate similarities
         similarities = [(name, self.encoder.similarity(unbound, vector)) 
                        for name, vector in candidates]
         
-        # Return best match
         best_match = max(similarities, key=lambda x: x[1])
         return best_match[0]
         
@@ -256,83 +195,54 @@ class VSAMessage:
         return {
             "id": self.id,
             "content": self.content,
-            "vector_hash": hashlib.md5(str(self.vector).encode()).hexdigest()
+            "vector_hash": hashlib.md5(str(self.vector.data.cpu().numpy()).encode()).hexdigest()
         }
 
 class VSACommunicationBus:
-    """Communication bus for agents using Vector Symbolic Architecture."""
+    """Enhanced communication bus with GPU acceleration and improved memory management."""
     
-    def __init__(self, dimension: int = 10000):
-        self.encoder = VSAEncoder(dimension=dimension)
+    def __init__(self, 
+                 dimension: int = 10000, 
+                 vtype: str = "bipolar",
+                 device: Optional[torch.device] = None):
+        """Initialize the communication bus."""
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+        self.encoder = EnhancedVSAEncoder(dimension=dimension, vtype=vtype, device=device)
         self.messages = []
+        self.agent_spaces = {}
+        self.topic_spaces = {}
+        self.active_dialogues = {}
+        self.semantic_index = defaultdict(list)
         
     def create_message(self) -> VSAMessage:
         """Create a new message."""
         return VSAMessage(self.encoder)
         
     def publish(self, message: VSAMessage) -> str:
-        """
-        Publish a message to the communication bus.
-        
-        Args:
-            message: VSA message to publish
-            
-        Returns:
-            Message ID
-        """
+        """Publish a message to the communication bus."""
         self.messages.append(message)
         return message.id
         
-    def query(self, query_vector: np.ndarray, top_k: int = 3) -> List[VSAMessage]:
-        """
-        Query for similar messages.
-        
-        Args:
-            query_vector: Query vector
-            top_k: Number of top results to return
-            
-        Returns:
-            List of similar messages
-        """
+    def query(self, query_vector: HDVector, top_k: int = 3) -> List[VSAMessage]:
+        """Query for similar messages."""
         if not self.messages:
             return []
             
-        # Calculate similarities
         similarities = [(message, self.encoder.similarity(query_vector, message.vector)) 
                        for message in self.messages if message.vector is not None]
         
-        # Sort by similarity
         sorted_messages = sorted(similarities, key=lambda x: x[1], reverse=True)
-        
-        # Return top-k
         return [message for message, _ in sorted_messages[:top_k]]
         
-    def create_compositional_concept(self, concepts: List[str]) -> np.ndarray:
-        """
-        Create a compositional concept by bundling multiple concepts.
-        
-        Args:
-            concepts: List of concept names
-            
-        Returns:
-            Vector representing the compositional concept
-        """
-        # Get vectors for each concept
+    def create_compositional_concept(self, concepts: List[str]) -> HDVector:
+        """Create a compositional concept."""
         vectors = [self.encoder.get_symbol(concept) for concept in concepts]
-        
-        # Bundle them
         return self.encoder.bundle(vectors)
         
-    def create_relational_structure(self, relations: Dict[str, str]) -> np.ndarray:
-        """
-        Create a relational structure using role-filler bindings.
-        
-        Args:
-            relations: Dictionary mapping roles to fillers
-            
-        Returns:
-            Vector representing the relational structure
-        """
+    def create_relational_structure(self, relations: Dict[str, str]) -> HDVector:
+        """Create a relational structure."""
         bindings = []
         
         for role, filler in relations.items():
@@ -344,64 +254,41 @@ class VSACommunicationBus:
         return self.encoder.bundle(bindings)
         
     def analogy(self, a: str, b: str, c: str) -> str:
-        """
-        Solve analogical reasoning (A is to B as C is to ?)
-        
-        Args:
-            a: First term
-            b: Second term
-            c: Third term
-            
-        Returns:
-            Fourth term completing the analogy
-        """
-        # Get vectors
+        """Solve analogical reasoning (A is to B as C is to ?)."""
         a_vector = self.encoder.get_symbol(a)
         b_vector = self.encoder.get_symbol(b)
         c_vector = self.encoder.get_symbol(c)
         
-        # Calculate A:B::C:?
-        # Use the transformation from A to B and apply to C
-        # In VSA, this is often modeled as (B * ~A) * C
-        # where ~A is the pseudo-inverse of A (for bipolar vectors, it's just A again)
-        transformation = self.encoder.bind(b_vector, a_vector)  # B * A (since A * A = 1 for bipolar)
+        transformation = self.encoder.bind(b_vector, a_vector)
         target = self.encoder.bind(transformation, c_vector)
         
-        # Find closest symbol
         candidates = [(name, self.encoder.get_symbol(name)) 
                      for name in self.encoder.symbols]
         
-        # Calculate similarities
         similarities = [(name, self.encoder.similarity(target, vector)) 
                        for name, vector in candidates]
         
-        # Return best match
         best_match = max(similarities, key=lambda x: x[1])
         return best_match[0]
 
 # Example usage
 def example_usage():
-    """Demonstrate usage of the VSA system."""
-    # Initialize communication bus
-    bus = VSACommunicationBus(dimension=1000)
+    """Demonstrate usage of the enhanced VSA system."""
+    bus = VSACommunicationBus(dimension=1000, vtype="bipolar")
     
-    # Create a message
     message = bus.create_message()
     message.add_role_filler("sender", "agent1")
     message.add_role_filler("receiver", "agent2")
     message.add_role_filler("content", "task_completion")
     message.add_role_filler("priority", "high")
     
-    # Publish to bus
     bus.publish(message)
     
-    # Create a query vector
     query = bus.encoder.bind(
         bus.encoder.get_role("content"),
         bus.encoder.get_symbol("task_completion")
     )
     
-    # Query for similar messages
     results = bus.query(query)
     
     print("Query Results:")
@@ -409,11 +296,10 @@ def example_usage():
         print(f"Message: {msg.to_dict()}")
         print(f"Decoded content: {msg.get_filler('content')}")
     
-    # Demonstrate analogical reasoning
     result = bus.analogy("king", "queen", "man")
     print(f"\nAnalogy Result: king:queen::man:{result}")
     
     return bus
 
 if __name__ == "__main__":
-    example_usage() 
+    example_usage()
