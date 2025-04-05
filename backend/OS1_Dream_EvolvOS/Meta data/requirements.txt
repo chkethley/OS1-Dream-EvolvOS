@@ -1,0 +1,42 @@
+# Core dependencies
+numpy>=1.20.0
+scipy>=1.6.0
+torch>=1.8.0
+transformers>=4.5.0
+scikit-learn>=0.24.0
+
+# NLP and retrieval
+sentence-transformers>=2.0.0
+nltk>=3.6.0
+spacy>=3.0.0
+pyserini>=0.12.0
+faiss-cpu>=1.7.0
+
+# Memory and storage
+annoy>=1.17.0
+networkx>=2.5.0  # For entity graph
+lz4>=3.1.0  # For compression
+
+# Optimization
+bayesian-optimization>=1.2.0
+botorch>=0.4.0
+hyperopt>=0.2.5
+
+# Utilities
+tqdm>=4.60.0
+matplotlib>=3.4.0
+pandas>=1.2.0
+pyyaml>=5.4.0
+jupyter>=1.0.0  # For development notebooks
+
+# Logging and monitoring
+tensorboard>=2.5.0
+wandb>=0.10.0
+
+# For CLI interface
+click>=8.0.0
+rich>=10.0.0  # For pretty printing
+
+# Testing
+pytest>=6.2.0
+pytest-cov>=2.12.0 
